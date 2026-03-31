@@ -1,0 +1,6 @@
+1. When simulating the clothing in unreal engine with chaos cloth, we need to paint the MaxDistance.
+Info: The MaxDistance weight map in conjunction with the SimulationMaxDistanceConfig node informs how far the simulated cloth can move away from its animated skinned position.
+
+Solution: A MaxDistance Map for the clothing needs to be provided in addition to the static mesh of the clothing.
+
+2. Temporal Sampling
