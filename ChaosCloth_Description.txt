@@ -1,0 +1,85 @@
+This document describes the Chaos Cloth simulation setup on garment SkeletalMeshes driven by the alembic/SkeletalMesh of body using Blueprints.
+
+### Process
+
+**Input:**
+
+(human)
+
+1. **Skeletal mesh of the human (Body)**
+    
+    If possible, using only the humans Body (without feet, hands and face) and assembling the parts in post, will decrease the number of particles in the simulation and make it run faster.
+    
+2. **Collision physics asset of the human**
+    
+    A physics asset with capsules can be automatically generated with the SKM (skeletal mesh) of the human, when importing the SKM, but it will be significantly less accurate compared to a low poly version of the SKM or using the high poly count of the original model
+    
+
+(clothing)
+
+1. **Static mesh of the clothing**
+    
+    Can also be provided as SKM, but it still later needs to be converted into a SM (static mesh) and than transferred to the SKM of the Human. Ideally it will be provided in the USD Format, that contains physical properties to configure the clothing simulation automatically.
+    
+
+(disregarding the materials, animations)
+
+---
+
+It is important that the **reference position** of the SKM of the Human an the position of the SM of the clothing match up in a way, that Skin Weights can be transferred and the cloth doesn’t collide with anything.
+
+---
+
+**Cloth Asset:**
+In UE5 Chaos Cloth Simulation, a cloth asset contains the simulation data that defines how a piece of fabric behaves when driven by physics.
+
+When creating a cloth asset, the nodes for defining how the fabric will be simulated are pre-setup and the inputs just need to be added.
+
+**Procedure:**
+
+Importing the SM of the Clothing
+
+→ Transferring Skin Weights (using the SKM of the human)
+
+→ Painting the MaxDistance
+
+(The MaxDistance weight map in conjunction with the SimulationMaxDistanceConfig node informs how far the simulated cloth can move away from its animated skinned position.)
+
+→ SimulationLongRangeAttachment 
+
+The SimulationLongRangeAttachmentConfig node creates tether springs from the selected simulation vertex set to help with the simulation convergence, allowing to use lower number of iterations/subdivisions and making for a faster simulation.
+
+→ Configuration of physical properties: 
+
+- The SimulationStretchConfig, SimulationBendingConfig, and SimulationMassConfig are set by default to reuse the fabric parameters stored in the USD file, if provided.
+    
+    If not, the parameters, physical properties and constraints, must be set manually or through a config, that is received with the clothing in the pipeline.
+    
+- SimulationAerodynamicsConfig, SimulationDampingConfig and SimulationSelfCollisionSpheresConfig (Self-collision is disabled by default, but basic self-collision spheres can be enabled by setting this node as Active, or more costly and precise self-collision can be used with the SimulationSelfCollisionConfig node.)
+
+→ Setting the physics asset (paired with SimulationCollisionConfig)
+
+A Physics Asset is a collection of simplified collision bodies and constraints attached to a skeletal mesh that defines how it interacts with physics. It preserves what the clothing will collide with.
+
+Right now, a high poly physics asset of the human body was used instead of the generated capsules.
+
+In the future however, to make the simulation run faster, it is recommended to create a physics asset that uses a low poly body mesh as colliders (I couldn’t figure out how to do that yet - With UE5.7 a low poly SM of the SKM can be created but not used as a physical asset or imported into an existing one)
+
+→ Simulation Solvers (substeps and iterations)
+
+→ ClothAssetTerminal: 
+
+The ClothAssetTerminal generates the final Cloth Asset.
+Multiple LODs can be added/removed.
+
+The only things that need to be done from the default setup:
+
+1. Set a SM for the Clothing (USD preferred)
+2. Set a SKM
+3. Paint the MaxDistance
+4. Set a physics asset
+5. (config)
+
+---
+
+Output: Cloth Asset
