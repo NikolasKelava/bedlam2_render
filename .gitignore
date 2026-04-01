@@ -5,6 +5,3 @@ __pycache__/
 # BEDLAM2
 # Ground trajectory masks
 tools/sequence_generation/images/
-
-# Claude
-.claude/
