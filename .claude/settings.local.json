@@ -1,7 +1,8 @@
 {
   "permissions": {
     "allow": [
-      "Bash(grep -E \"\\\\.py$\")"
+      "Bash(grep -E \"\\\\.py$\")",
+      "Bash(find '/c/Users/Nikolas Kelava/Documents/BEDLAM3/bedlam2_render/unreal/cloth_simulation' -name *.py)"
     ]
   }
 }
