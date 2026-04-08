@@ -1,0 +1,24 @@
+{
+	"FileVersion": 3,
+	"Version": 1,
+	"VersionName": "1.0",
+	"FriendlyName": "BedlamClothSetup",
+	"Description": "not yet",
+	"Category": "Other",
+	"CreatedBy": "Nikolas Kelava",
+	"CreatedByURL": "",
+	"DocsURL": "",
+	"MarketplaceURL": "",
+	"SupportURL": "",
+	"CanContainContent": true,
+	"IsBetaVersion": false,
+	"IsExperimentalVersion": false,
+	"Installed": false,
+	"Modules": [
+		{
+			"Name": "BedlamClothSetup",
+			"Type": "Runtime",
+			"LoadingPhase": "Default"
+		}
+	]
+}

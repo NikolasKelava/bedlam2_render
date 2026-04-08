@@ -1,0 +1,15 @@
+{
+    "Version": "1.2",
+    "Data": {
+        "Source": "c:\\users\\nikolas kelava\\documents\\bedlam3\\bedlam2_render\\unreal\\cloth_simulation\\cloth_simulation\\plugins\\bedlamclothsetup\\intermediate\\build\\win64\\x64\\unrealeditor\\development\\bedlamclothsetup\\module.bedlamclothsetup.cpp",
+        "ProvidedModule": "",
+        "PCH": "c:\\users\\nikolas kelava\\documents\\bedlam3\\bedlam2_render\\unreal\\cloth_simulation\\cloth_simulation\\intermediate\\build\\win64\\x64\\cloth_simulationeditor\\development\\unrealed\\sharedpch.unrealed.project.valapi.valexpapi.cpp20.h.pch",
+        "Includes": [
+            "c:\\users\\nikolas kelava\\documents\\bedlam3\\bedlam2_render\\unreal\\cloth_simulation\\cloth_simulation\\plugins\\bedlamclothsetup\\intermediate\\build\\win64\\x64\\unrealeditor\\development\\bedlamclothsetup\\definitions.bedlamclothsetup.h",
+            "c:\\users\\nikolas kelava\\documents\\bedlam3\\bedlam2_render\\unreal\\cloth_simulation\\cloth_simulation\\plugins\\bedlamclothsetup\\intermediate\\build\\win64\\x64\\unrealeditor\\development\\bedlamclothsetup\\permoduleinline.gen.cpp",
+            "c:\\program files\\epic games\\ue_5.7\\engine\\source\\runtime\\core\\public\\hal\\permoduleinline.inl"
+        ],
+        "ImportedModules": [],
+        "ImportedHeaderUnits": []
+    }
+}

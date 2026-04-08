@@ -1,0 +1,9 @@
+{
+	"RemapUnityFiles": 
+	{
+		"Module.BedlamClothSetup.cpp.obj": [
+			"PerModuleInline.gen.cpp.obj",
+			"BedlamClothSetup.cpp.obj"
+		]
+	}
+}
