@@ -3,7 +3,7 @@
 	"Version": 1,
 	"VersionName": "1.0",
 	"FriendlyName": "BedlamClothSetup",
-	"Description": "not yet",
+	"Description": "Chaos Cloth asset creation and Chaos Cache recording for BEDLAM2 pipeline",
 	"Category": "Other",
 	"CreatedBy": "Nikolas Kelava",
 	"CreatedByURL": "",
@@ -17,8 +17,15 @@
 	"Modules": [
 		{
 			"Name": "BedlamClothSetup",
-			"Type": "Runtime",
-			"LoadingPhase": "Default"
+			"Type": "Editor",
+			"LoadingPhase": "PostEngineInit"
 		}
+	],
+	"Plugins": [
+		{ "Name": "ChaosClothAsset", "Enabled": true },
+		{ "Name": "ChaosClothAssetEditor", "Enabled": true },
+		{ "Name": "ChaosCaching", "Enabled": true },
+		{ "Name": "Dataflow", "Enabled": true },
+		{ "Name": "EditorScriptingUtilities", "Enabled": true }
 	]
 }

@@ -1,14 +1,18 @@
-// Copyright Epic Games, Inc. All Rights Reserved.
-
 #pragma once
 
 #include "Modules/ModuleManager.h"
 
+struct IConsoleCommand;
+
 class FBedlamClothSetupModule : public IModuleInterface
 {
 public:
-
-	/** IModuleInterface implementation */
 	virtual void StartupModule() override;
 	virtual void ShutdownModule() override;
+
+private:
+	IConsoleCommand* CmdCreateClothAsset = nullptr;
+	IConsoleCommand* CmdSetWeightMap = nullptr;
+	IConsoleCommand* CmdConfigureSimulation = nullptr;
+	IConsoleCommand* CmdRecordChaosCache = nullptr;
 };

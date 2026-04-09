@@ -3,7 +3,8 @@
 	{
 		"Module.BedlamClothSetup.cpp.obj": [
 			"PerModuleInline.gen.cpp.obj",
-			"BedlamClothSetup.cpp.obj"
+			"BedlamClothSetup.cpp.obj",
+			"BedlamClothSetupCommands.cpp.obj"
 		]
 	}
 }
