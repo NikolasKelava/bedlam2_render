@@ -447,10 +447,185 @@ void FBedlamClothSetupCommands::ConfigureSimulation(const TArray<FString>& Args,
 {
 	if (Args.Num() < 2)
 	{
-		UE_LOG(LogBedlamCloth, Error, TEXT("Usage: BedlamCloth.ConfigureSimulation <ClothAssetPath> [Key=Value ...]"));
+		UE_LOG(LogBedlamCloth, Error,
+			TEXT("Usage: BedlamCloth.ConfigureSimulation <ClothAssetPath> [Key=Value ...]\n")
+			TEXT("  Keys: Gravity (scale), Damping (0-1), SelfCollision (true only),\n")
+			TEXT("        Substeps (int), Iterations (int), MaxDistance (float),\n")
+			TEXT("        CollisionThickness (float)"));
 		return;
 	}
-	UE_LOG(LogBedlamCloth, Log, TEXT("ConfigureSimulation called: Asset=%s"), *Args[0]);
+
+	const FString& ClothAssetPath = Args[0];
+	UE_LOG(LogBedlamCloth, Log, TEXT("ConfigureSimulation: Asset=%s"), *ClothAssetPath);
+
+	// --- Load cloth asset and its Dataflow graph ---
+	UChaosClothAsset* ClothAsset = nullptr;
+	UDataflow* DataflowAsset = nullptr;
+	TSharedPtr<UE::Dataflow::FGraph> Graph;
+
+	if (!LoadClothAndGraph(ClothAssetPath, ClothAsset, DataflowAsset, Graph))
+	{
+		return;
+	}
+
+	// --- Parse Key=Value pairs ---
+	TMap<FString, FString> Params;
+	for (int32 i = 1; i < Args.Num(); ++i)
+	{
+		FString Key, Value;
+		if (Args[i].Split(TEXT("="), &Key, &Value))
+		{
+			Params.Add(Key, Value);
+		}
+		else
+		{
+			UE_LOG(LogBedlamCloth, Warning, TEXT("Ignoring malformed param (no '='): %s"), *Args[i]);
+		}
+	}
+
+	int32 AppliedCount = 0;
+
+	// --- Gravity ---
+	if (const FString* Val = Params.Find(TEXT("Gravity")))
+	{
+		auto* Node = static_cast<FChaosClothAssetSimulationGravityConfigNode*>(
+			FindNodeByType(*Graph, FName("FChaosClothAssetSimulationGravityConfigNode")));
+		if (Node)
+		{
+			float GravityScale = FCString::Atof(**Val);
+			Node->GravityScaleWeighted.Low  = GravityScale;
+			Node->GravityScaleWeighted.High = GravityScale;
+			UE_LOG(LogBedlamCloth, Log, TEXT("  Gravity scale = %f"), GravityScale);
+			++AppliedCount;
+		}
+		else
+		{
+			UE_LOG(LogBedlamCloth, Warning, TEXT("  GravityConfigNode not found in graph"));
+		}
+	}
+
+	// --- Damping ---
+	if (const FString* Val = Params.Find(TEXT("Damping")))
+	{
+		auto* Node = static_cast<FChaosClothAssetSimulationDampingConfigNode*>(
+			FindNodeByType(*Graph, FName("FChaosClothAssetSimulationDampingConfigNode")));
+		if (Node)
+		{
+			float Damping = FCString::Atof(**Val);
+			Node->DampingCoefficientWeighted.Low  = Damping;
+			Node->DampingCoefficientWeighted.High = Damping;
+			UE_LOG(LogBedlamCloth, Log, TEXT("  Damping = %f"), Damping);
+			++AppliedCount;
+		}
+		else
+		{
+			UE_LOG(LogBedlamCloth, Warning, TEXT("  DampingConfigNode not found in graph"));
+		}
+	}
+
+	// --- SelfCollision ---
+	if (const FString* Val = Params.Find(TEXT("SelfCollision")))
+	{
+		// bUseSelfCollisions is private in v2 node and defaults to true.
+		// Self-collision is enabled by the node's presence in the graph.
+		// To disable: would need to disconnect the node from the chain (not yet implemented).
+		bool bEnable = Val->ToBool();
+		if (bEnable)
+		{
+			UE_LOG(LogBedlamCloth, Log, TEXT("  SelfCollision = true (already enabled via node presence)"));
+			++AppliedCount;
+		}
+		else
+		{
+			UE_LOG(LogBedlamCloth, Warning,
+				TEXT("  SelfCollision=false not supported. Remove the SelfCollision node from the graph to disable."));
+		}
+	}
+
+	// --- Substeps ---
+	if (const FString* Val = Params.Find(TEXT("Substeps")))
+	{
+		auto* Node = static_cast<FChaosClothAssetSimulationSolverConfigNode*>(
+			FindNodeByType(*Graph, FName("FChaosClothAssetSimulationSolverConfigNode")));
+		if (Node)
+		{
+			int32 Substeps = FCString::Atoi(**Val);
+			Node->NumSubstepsImported.ImportedValue = Substeps;
+			UE_LOG(LogBedlamCloth, Log, TEXT("  Substeps = %d"), Substeps);
+			++AppliedCount;
+		}
+		else
+		{
+			UE_LOG(LogBedlamCloth, Warning, TEXT("  SolverConfigNode not found in graph"));
+		}
+	}
+
+	// --- Iterations ---
+	if (const FString* Val = Params.Find(TEXT("Iterations")))
+	{
+		auto* Node = static_cast<FChaosClothAssetSimulationSolverConfigNode*>(
+			FindNodeByType(*Graph, FName("FChaosClothAssetSimulationSolverConfigNode")));
+		if (Node)
+		{
+			int32 Iterations = FCString::Atoi(**Val);
+			Node->NumIterations = Iterations;
+			UE_LOG(LogBedlamCloth, Log, TEXT("  Iterations = %d"), Iterations);
+			++AppliedCount;
+		}
+		else
+		{
+			UE_LOG(LogBedlamCloth, Warning, TEXT("  SolverConfigNode not found in graph"));
+		}
+	}
+
+	// --- MaxDistance ---
+	if (const FString* Val = Params.Find(TEXT("MaxDistance")))
+	{
+		auto* Node = static_cast<FChaosClothAssetSimulationMaxDistanceConfigNode*>(
+			FindNodeByType(*Graph, FName("FChaosClothAssetSimulationMaxDistanceConfigNode")));
+		if (Node)
+		{
+			float MaxDist = FCString::Atof(**Val);
+			Node->MaxDistance.Low  = 0.f;
+			Node->MaxDistance.High = MaxDist;
+			UE_LOG(LogBedlamCloth, Log, TEXT("  MaxDistance = [0, %f]"), MaxDist);
+			++AppliedCount;
+		}
+		else
+		{
+			UE_LOG(LogBedlamCloth, Warning, TEXT("  MaxDistanceConfigNode not found in graph"));
+		}
+	}
+
+	// --- CollisionThickness ---
+	if (const FString* Val = Params.Find(TEXT("CollisionThickness")))
+	{
+		auto* Node = static_cast<FChaosClothAssetSimulationCollisionConfigNode*>(
+			FindNodeByType(*Graph, FName("FChaosClothAssetSimulationCollisionConfigNode")));
+		if (Node)
+		{
+			float Thickness = FCString::Atof(**Val);
+			Node->CollisionThicknessImported.ImportedValue = Thickness;
+			UE_LOG(LogBedlamCloth, Log, TEXT("  CollisionThickness = %f"), Thickness);
+			++AppliedCount;
+		}
+		else
+		{
+			UE_LOG(LogBedlamCloth, Warning, TEXT("  CollisionConfigNode not found in graph"));
+		}
+	}
+
+	if (AppliedCount == 0)
+	{
+		UE_LOG(LogBedlamCloth, Warning, TEXT("No valid parameters were applied. Check key names."));
+		return;
+	}
+
+	// --- Re-evaluate and save ---
+	ReevaluateAndSave(ClothAsset, DataflowAsset, ClothAssetPath);
+
+	UE_LOG(LogBedlamCloth, Log, TEXT("SUCCESS: ConfigureSimulation applied %d parameter(s) to %s"),
+		AppliedCount, *ClothAssetPath);
 }
 
 void FBedlamClothSetupCommands::RecordChaosCache(const TArray<FString>& Args, UWorld* World)
