@@ -297,37 +297,150 @@ void FBedlamClothSetupCommands::CreateClothAsset(const TArray<FString>& Args, UW
 	}
 }
 
+// ---------------------------------------------------------------------------
+// Helper: find a node by type name in an existing Dataflow graph
+// ---------------------------------------------------------------------------
+static FDataflowNode* FindNodeByType(UE::Dataflow::FGraph& Graph, const FName& TypeName)
+{
+	for (TSharedPtr<FDataflowNode>& Node : Graph.GetNodes())
+	{
+		if (Node.IsValid() && Node->GetType() == TypeName)
+		{
+			return Node.Get();
+		}
+	}
+	return nullptr;
+}
+
+// ---------------------------------------------------------------------------
+// Helper: load a cloth asset and get its Dataflow graph (returns false on failure)
+// ---------------------------------------------------------------------------
+static bool LoadClothAndGraph(
+	const FString& ClothAssetPath,
+	UChaosClothAsset*& OutClothAsset,
+	UDataflow*& OutDataflow,
+	TSharedPtr<UE::Dataflow::FGraph>& OutGraph)
+{
+	OutClothAsset = LoadObject<UChaosClothAsset>(nullptr, *ClothAssetPath);
+	if (!OutClothAsset)
+	{
+		UE_LOG(LogBedlamCloth, Error, TEXT("Failed to load ChaosClothAsset: %s"), *ClothAssetPath);
+		return false;
+	}
+
+	OutDataflow = OutClothAsset->GetDataflowInstance().GetDataflowAsset();
+	if (!OutDataflow)
+	{
+		UE_LOG(LogBedlamCloth, Error, TEXT("ClothAsset has no associated UDataflow asset"));
+		return false;
+	}
+
+	OutGraph = OutDataflow->GetDataflow();
+	if (!OutGraph.IsValid())
+	{
+		UE_LOG(LogBedlamCloth, Error, TEXT("UDataflow has no valid graph"));
+		return false;
+	}
+
+	return true;
+}
+
+// ---------------------------------------------------------------------------
+// Helper: re-evaluate a cloth asset's Dataflow and save both assets
+// ---------------------------------------------------------------------------
+static void ReevaluateAndSave(
+	UChaosClothAsset* ClothAsset,
+	UDataflow* DataflowAsset,
+	const FString& ClothAssetPath)
+{
+	UE_LOG(LogBedlamCloth, Log, TEXT("Re-evaluating Dataflow..."));
+	UDataflowBlueprintLibrary::EvaluateTerminalNodeByName(
+		DataflowAsset, FName("Terminal"), ClothAsset);
+
+	DataflowAsset->MarkPackageDirty();
+	ClothAsset->MarkPackageDirty();
+
+	const FString DFAssetPath = DataflowAsset->GetOutermost()->GetName();
+	UEditorAssetLibrary::SaveAsset(DFAssetPath, false);
+	UEditorAssetLibrary::SaveAsset(ClothAssetPath, false);
+
+	UE_LOG(LogBedlamCloth, Log, TEXT("Assets saved."));
+}
+
+// ===========================================================================
+// BedlamCloth.SetWeightMap
+// ===========================================================================
 void FBedlamClothSetupCommands::SetWeightMap(const TArray<FString>& Args, UWorld* World)
 {
-	if (Args.Num() >= 1 && Args[0] == TEXT("debug_factory"))
+	if (Args.Num() < 2)
 	{
-		// Debug: list all registered Dataflow node types
-		UE_LOG(LogBedlamCloth, Log, TEXT("=== Registered Dataflow Node Types ==="));
-		TArray<UE::Dataflow::FFactoryParameters> AllParams =
-			UE::Dataflow::FNodeFactory::GetInstance()->RegisteredParameters();
-		for (const auto& P : AllParams)
-		{
-			if (P.TypeName.ToString().Contains(TEXT("Cloth")) ||
-				P.TypeName.ToString().Contains(TEXT("Transfer")) ||
-				P.TypeName.ToString().Contains(TEXT("Physics")) ||
-				P.TypeName.ToString().Contains(TEXT("Terminal")) ||
-				P.TypeName.ToString().Contains(TEXT("Weight")) ||
-				P.TypeName.ToString().Contains(TEXT("Import")))
-			{
-				UE_LOG(LogBedlamCloth, Log, TEXT("  Type='%s'  Display='%s'  Category='%s'"),
-					*P.TypeName.ToString(), *P.DisplayName.ToString(), *P.Category.ToString());
-			}
-		}
-		UE_LOG(LogBedlamCloth, Log, TEXT("=== Total registered types: %d ==="), AllParams.Num());
+		UE_LOG(LogBedlamCloth, Error,
+			TEXT("Usage: BedlamCloth.SetWeightMap <ClothAssetPath> <Mode> [FilePath]\n")
+			TEXT("  Modes: all_dynamic, auto, file"));
 		return;
 	}
 
-	if (Args.Num() < 2)
+	const FString& ClothAssetPath = Args[0];
+	const FString& Mode = Args[1];
+
+	UE_LOG(LogBedlamCloth, Log, TEXT("SetWeightMap: Asset=%s Mode=%s"), *ClothAssetPath, *Mode);
+
+	// --- Load cloth asset and its Dataflow graph ---
+	UChaosClothAsset* ClothAsset = nullptr;
+	UDataflow* DataflowAsset = nullptr;
+	TSharedPtr<UE::Dataflow::FGraph> Graph;
+
+	if (!LoadClothAndGraph(ClothAssetPath, ClothAsset, DataflowAsset, Graph))
 	{
-		UE_LOG(LogBedlamCloth, Error, TEXT("Usage: BedlamCloth.SetWeightMap <ClothAssetPath> <Mode> [FilePath]"));
 		return;
 	}
-	UE_LOG(LogBedlamCloth, Log, TEXT("SetWeightMap called: Asset=%s Mode=%s"), *Args[0], *Args[1]);
+
+	// --- Find the MaxDistance config node ---
+	auto* MaxDistNode = static_cast<FChaosClothAssetSimulationMaxDistanceConfigNode*>(
+		FindNodeByType(*Graph, FName("FChaosClothAssetSimulationMaxDistanceConfigNode")));
+
+	if (!MaxDistNode)
+	{
+		UE_LOG(LogBedlamCloth, Error, TEXT("MaxDistance config node not found in Dataflow graph"));
+		return;
+	}
+
+	// --- Apply mode ---
+	if (Mode == TEXT("all_dynamic"))
+	{
+		// All vertices fully dynamic: MaxDistance = [0, 1000] with no per-vertex weight map
+		MaxDistNode->MaxDistance.Low  = 0.f;
+		MaxDistNode->MaxDistance.High = 1000.f;
+
+		UE_LOG(LogBedlamCloth, Log, TEXT("Set MaxDistance to all_dynamic: Low=0 High=1000"));
+	}
+	else if (Mode == TEXT("auto"))
+	{
+		UE_LOG(LogBedlamCloth, Warning,
+			TEXT("'auto' mode not yet implemented. Requires per-vertex proximity computation."));
+		return;
+	}
+	else if (Mode == TEXT("file"))
+	{
+		if (Args.Num() < 3)
+		{
+			UE_LOG(LogBedlamCloth, Error, TEXT("'file' mode requires a file path argument"));
+			return;
+		}
+		UE_LOG(LogBedlamCloth, Warning,
+			TEXT("'file' mode not yet implemented. Requires WeightMapNode insertion for per-vertex control."));
+		return;
+	}
+	else
+	{
+		UE_LOG(LogBedlamCloth, Error, TEXT("Unknown mode '%s'. Valid modes: all_dynamic, auto, file"), *Mode);
+		return;
+	}
+
+	// --- Re-evaluate and save ---
+	ReevaluateAndSave(ClothAsset, DataflowAsset, ClothAssetPath);
+
+	UE_LOG(LogBedlamCloth, Log, TEXT("SUCCESS: Weight map updated for %s"), *ClothAssetPath);
 }
 
 void FBedlamClothSetupCommands::ConfigureSimulation(const TArray<FString>& Args, UWorld* World)
