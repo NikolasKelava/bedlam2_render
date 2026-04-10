@@ -21,6 +21,7 @@ public class BedlamClothSetup : ModuleRules
 		PrivateDependencyModuleNames.AddRange(
 			new string[]
 			{
+				"ChaosClothAsset",
 				"ChaosClothAssetEngine",
 				"ChaosClothAssetDataflowNodes",
 				"ChaosClothAssetTools",
