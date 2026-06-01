@@ -20,6 +20,7 @@
 // Chaos Caching
 #include "Chaos/CacheManagerActor.h"
 #include "Chaos/CacheCollection.h"
+#include "Chaos/ChaosCache.h"
 
 // Scene / actors for cache recording
 #include "Editor.h"
@@ -667,12 +668,20 @@ void FBedlamClothSetupCommands::ConfigureSimulation(const TArray<FString>& Args,
 // 1/30s. This makes recording deterministic and immune to real-time hitches.
 static constexpr double BedlamRecordFrameRate = 30.0;
 
+// Frames the body is held on its first animation pose before playback starts, so
+// the cloth can drape/settle onto the body. These settle frames are recorded at
+// the start of the cache (the post/MRQ warmup step can discard them).
+static constexpr int32 BedlamWarmupFrames = 30;
+
 struct FBedlamRecordSession
 {
 	bool   bActive      = false;
-	int32  TargetFrames = 0;   // number of fixed-timestep frames to record
+	int32  WarmupFrames = 0;   // settle frames before animation playback
+	int32  AnimFrames   = 0;   // frames of actual animation to record
+	int32  TargetFrames = 0;   // WarmupFrames + AnimFrames
 	int32  FrameCount   = 0;   // frames elapsed since PIE started
-	int32  NumFrames    = 0;   // requested frame count (0 = derived from anim length)
+	int32  NumFrames    = 0;   // requested anim frame count (0 = derived from anim length)
+	bool   bAnimStarted = false;
 	FString CachePath;
 	FName   CacheName;
 
@@ -685,6 +694,7 @@ struct FBedlamRecordSession
 	TWeakObjectPtr<ASkeletalMeshActor>    BodyActor;
 	TWeakObjectPtr<AActor>                ClothActor;
 	TWeakObjectPtr<UAnimSequence>         Anim;
+	TWeakObjectPtr<USkeletalMeshComponent> SimBodyComp;  // PIE-world body component
 
 	FDelegateHandle           PostPIEStartedHandle;
 	FDelegateHandle           EndPIEHandle;
@@ -706,10 +716,26 @@ static bool OnRecordTick(float /*DeltaTime*/)
 	}
 
 	++GRecordSession.FrameCount;
+
+	// Warmup phase complete -> start the body animation (cloth has now settled).
+	if (!GRecordSession.bAnimStarted && GRecordSession.FrameCount >= GRecordSession.WarmupFrames)
+	{
+		if (USkeletalMeshComponent* SimComp = GRecordSession.SimBodyComp.Get())
+		{
+			SimComp->SetPosition(0.f);
+			SimComp->Play(/*bLooping*/ false);
+			GRecordSession.bAnimStarted = true;
+			UE_LOG(LogBedlamCloth, Log,
+				TEXT("Record: warmup complete (%d frames); starting body animation."),
+				GRecordSession.WarmupFrames);
+		}
+	}
+
 	if (GRecordSession.FrameCount >= GRecordSession.TargetFrames)
 	{
-		UE_LOG(LogBedlamCloth, Log, TEXT("Record: reached %d/%d frames. Ending PIE."),
-			GRecordSession.FrameCount, GRecordSession.TargetFrames);
+		UE_LOG(LogBedlamCloth, Log, TEXT("Record: reached %d/%d frames (%d warmup + %d anim). Ending PIE."),
+			GRecordSession.FrameCount, GRecordSession.TargetFrames,
+			GRecordSession.WarmupFrames, GRecordSession.AnimFrames);
 		if (GEditor)
 		{
 			GEditor->RequestEndPlayMap();
@@ -730,9 +756,10 @@ static void OnRecordPostPIEStarted(const bool bIsSimulating)
 	}
 
 	// The PlayAnimation "playing" state set on the editor-world body does not
-	// resume after the editor->PIE world duplication, so the body stays frozen at
-	// frame 0 (which leaves the cloth static). Re-start the animation directly on
-	// the PIE-world body actor.
+	// resume after the editor->PIE world duplication. Set up the animation
+	// directly on the PIE-world body actor, but hold it on the first frame
+	// (stopped) so the cloth can settle during the warmup phase. The ticker
+	// starts playback once the warmup frames have elapsed.
 	if (ASkeletalMeshActor* EditorBody = GRecordSession.BodyActor.Get())
 	{
 		AActor* SimBody = EditorUtilities::GetSimWorldCounterpartActor(EditorBody);
@@ -745,8 +772,12 @@ static void OnRecordPostPIEStarted(const bool bIsSimulating)
 				SimComp->VisibilityBasedAnimTickOption = EVisibilityBasedAnimTickOption::AlwaysTickPoseAndRefreshBones;
 				SimComp->bEnableUpdateRateOptimizations = false;
 				SimComp->PlayAnimation(Anim, /*bLooping*/ false);
-				UE_LOG(LogBedlamCloth, Log, TEXT("Record: started animation on PIE body '%s'."),
-					*SimSkelActor->GetActorLabel());
+				SimComp->Stop();             // pause...
+				SimComp->SetPosition(0.f);   // ...holding the first frame for settling
+				GRecordSession.SimBodyComp = SimComp;
+				UE_LOG(LogBedlamCloth, Log,
+					TEXT("Record: PIE body '%s' set up, holding frame 0 for %d warmup frames."),
+					*SimSkelActor->GetActorLabel(), GRecordSession.WarmupFrames);
 			}
 		}
 		else
@@ -771,8 +802,88 @@ static void OnRecordPostPIEStarted(const bool bIsSimulating)
 		1.0 / BedlamRecordFrameRate, GRecordSession.TargetFrames);
 }
 
-// PIE has ended. Restore the timestep, tear down delegates/ticker and report.
-// (Step 3 will verify recorded frames and save the cache collection here.)
+// Deferred finalize (one tick after EndPIE): verify the recorded cache, save the
+// collection asset, clean up the temporary actors, and tear down the session.
+// Running this after PIE has fully torn down avoids the asset being re-dirtied by
+// the teardown/cache-finalization that races a save made inside the EndPIE callback.
+static bool OnRecordFinalize(float /*DeltaTime*/)
+{
+	if (!GRecordSession.bActive)
+	{
+		return false; // one-shot
+	}
+
+	// -----------------------------------------------------------------------
+	// Verify the recorded cache and save the collection asset.
+	// The collection is a content asset shared by the editor and PIE worlds, so
+	// the frames recorded during PIE (finalized in EndEvaluate/EndRecord on
+	// EndPlay) are present here.
+	// -----------------------------------------------------------------------
+	if (UChaosCacheCollection* Collection = GRecordSession.CacheCollection.Get())
+	{
+		UChaosCache* Cache = Collection->FindCache(GRecordSession.CacheName);
+		const int32 NumRec = Cache ? static_cast<int32>(Cache->NumRecordedFrames) : 0;
+		const float Dur    = Cache ? Cache->RecordedDuration : 0.f;
+
+		if (Cache && NumRec > 0)
+		{
+			Collection->MarkPackageDirty();
+			const bool bSaved = UEditorAssetLibrary::SaveAsset(GRecordSession.CachePath, false);
+			UE_LOG(LogBedlamCloth, Log,
+				TEXT("Record: cache '%s' recorded %d frames (%.3fs). Saved=%s -> %s"),
+				*GRecordSession.CacheName.ToString(), NumRec, Dur,
+				bSaved ? TEXT("OK") : TEXT("FAIL"), *GRecordSession.CachePath);
+		}
+		else
+		{
+			UE_LOG(LogBedlamCloth, Warning,
+				TEXT("Record: cache '%s' has %d recorded frames; not saving (no data captured)."),
+				*GRecordSession.CacheName.ToString(), NumRec);
+		}
+	}
+	else
+	{
+		UE_LOG(LogBedlamCloth, Warning, TEXT("Record: cache collection no longer valid; cannot save."));
+	}
+
+	// -----------------------------------------------------------------------
+	// Clean up the temporary editor-world actors so re-runs start clean and
+	// only one cache manager is ever present.
+	// -----------------------------------------------------------------------
+	if (UWorld* EditorWorld = GEditor ? GEditor->GetEditorWorldContext().World() : nullptr)
+	{
+		auto DestroyIfValid = [EditorWorld](AActor* Actor)
+		{
+			if (Actor)
+			{
+				EditorWorld->EditorDestroyActor(Actor, /*bShouldModifyLevel*/ true);
+			}
+		};
+		DestroyIfValid(GRecordSession.EditorManager.Get());
+		DestroyIfValid(GRecordSession.ClothActor.Get());
+		DestroyIfValid(GRecordSession.BodyActor.Get());
+	}
+
+	UE_LOG(LogBedlamCloth, Log,
+		TEXT("SUCCESS (Step 3): recording finished after %d frames; temp actors cleaned up."),
+		GRecordSession.FrameCount);
+
+	// -----------------------------------------------------------------------
+	// Tear down delegates / ticker / state.
+	// -----------------------------------------------------------------------
+	if (GRecordSession.TickerHandle.IsValid())
+	{
+		FTSTicker::GetCoreTicker().RemoveTicker(GRecordSession.TickerHandle);
+	}
+	FEditorDelegates::PostPIEStarted.Remove(GRecordSession.PostPIEStartedHandle);
+	FEditorDelegates::EndPIE.Remove(GRecordSession.EndPIEHandle);
+
+	GRecordSession.Reset();
+	return false; // one-shot ticker
+}
+
+// PIE has ended: restore the timestep and schedule the finalize (save + cleanup)
+// for the next editor tick, once PIE has fully torn down.
 static void OnRecordEndPIE(const bool bIsSimulating)
 {
 	if (!GRecordSession.bActive)
@@ -785,17 +896,10 @@ static void OnRecordEndPIE(const bool bIsSimulating)
 	FApp::SetFixedDeltaTime(GRecordSession.SavedFixedDeltaTime);
 
 	UE_LOG(LogBedlamCloth, Log,
-		TEXT("Record: PIE ended after %d frames (Step 2). Finalize/save will be added in Step 3."),
+		TEXT("Record: PIE ended after %d frames. Finalizing (save + cleanup) on next tick..."),
 		GRecordSession.FrameCount);
 
-	if (GRecordSession.TickerHandle.IsValid())
-	{
-		FTSTicker::GetCoreTicker().RemoveTicker(GRecordSession.TickerHandle);
-	}
-	FEditorDelegates::PostPIEStarted.Remove(GRecordSession.PostPIEStartedHandle);
-	FEditorDelegates::EndPIE.Remove(GRecordSession.EndPIEHandle);
-
-	GRecordSession.Reset();
+	FTSTicker::GetCoreTicker().AddTicker(FTickerDelegate::CreateStatic(&OnRecordFinalize), 0.0f);
 }
 
 // ---------------------------------------------------------------------------
@@ -835,15 +939,19 @@ static UChaosCacheCollection* CreateOrLoadCacheCollection(const FString& CachePa
 }
 
 // ===========================================================================
-// BedlamCloth.RecordChaosCache
+// BedlamCloth.RecordChaosCache <ClothPath> <BodySKM> <Anim> <OutCachePath> [NumFrames]
 //
-// STEP 1 (current): assemble the recording scene in the editor world.
-//   - load cloth / body / anim assets
-//   - create the output ChaosCacheCollection asset
-//   - spawn body (ASkeletalMeshActor playing the anim), cloth
-//     (UChaosClothComponent bound to the body), and an AChaosCacheManager
-//     configured to record the cloth component.
-//   No PIE / recording is launched yet (steps 2-4).
+// Records a Chaos Cache of the cloth simulating on the animated body:
+//   1. Assemble the scene in the editor world: body (ASkeletalMeshActor), cloth
+//      (UChaosClothComponent leader-posed to the body + collision source) and an
+//      AChaosCacheManager (Record mode) observing the cloth; create the output
+//      UChaosCacheCollection.
+//   2. Launch PIE. On PostPIEStarted: force a fixed 1/30s timestep, set up the
+//      PIE-world body animation held at frame 0, and start a frame-counting ticker.
+//   3. Ticker: hold for BedlamWarmupFrames (cloth settles), then play the anim;
+//      end PIE once warmup + anim frames are recorded.
+//   4. On EndPIE: (deferred one tick) verify the recorded frames, save the cache
+//      collection, and clean up the temporary actors.
 // ===========================================================================
 void FBedlamClothSetupCommands::RecordChaosCache(const TArray<FString>& Args, UWorld* World)
 {
@@ -861,6 +969,37 @@ void FBedlamClothSetupCommands::RecordChaosCache(const TArray<FString>& Args, UW
 
 	UE_LOG(LogBedlamCloth, Log, TEXT("RecordChaosCache: Cloth=%s Body=%s Anim=%s Cache=%s NumFrames=%d"),
 		*ClothPath, *BodyPath, *AnimPath, *CachePath, NumFrames);
+
+	// -----------------------------------------------------------------------
+	// 0. Guard against concurrent sessions; recover from a stale one.
+	//    If a previous PIE failed to start (so PostPIEStarted/EndPIE never
+	//    fired) the session would otherwise stay "active" forever and block
+	//    every future run. Only a genuinely in-progress PIE should abort.
+	// -----------------------------------------------------------------------
+	if (GRecordSession.bActive)
+	{
+		const bool bPIEInProgress = GEditor && GEditor->PlayWorld != nullptr;
+		if (bPIEInProgress)
+		{
+			UE_LOG(LogBedlamCloth, Error, TEXT("A record session is already in progress (PIE active). Aborting."));
+			return;
+		}
+
+		UE_LOG(LogBedlamCloth, Warning, TEXT("Clearing a stale record session before starting a new one."));
+		if (GRecordSession.TickerHandle.IsValid())
+		{
+			FTSTicker::GetCoreTicker().RemoveTicker(GRecordSession.TickerHandle);
+		}
+		FEditorDelegates::PostPIEStarted.Remove(GRecordSession.PostPIEStartedHandle);
+		FEditorDelegates::EndPIE.Remove(GRecordSession.EndPIEHandle);
+		GRecordSession.Reset();
+	}
+
+	if (!GEditor)
+	{
+		UE_LOG(LogBedlamCloth, Error, TEXT("No GEditor available; RecordChaosCache requires the editor."));
+		return;
+	}
 
 	// -----------------------------------------------------------------------
 	// 1. Load source assets
@@ -981,20 +1120,18 @@ void FBedlamClothSetupCommands::RecordChaosCache(const TArray<FString>& Args, UW
 	// -----------------------------------------------------------------------
 	// 7. Launch PIE to drive the simulation; auto-end after the target duration
 	// -----------------------------------------------------------------------
-	if (GRecordSession.bActive)
-	{
-		UE_LOG(LogBedlamCloth, Error, TEXT("A record session is already in progress. Aborting."));
-		return;
-	}
-
-	const float AnimLength   = AnimSeq->GetPlayLength();
-	const int32 TargetFrames = (NumFrames > 0)
+	const float AnimLength  = AnimSeq->GetPlayLength();
+	const int32 AnimFrames  = (NumFrames > 0)
 		? NumFrames
 		: FMath::CeilToInt(AnimLength * BedlamRecordFrameRate);
+	const int32 TargetFrames = BedlamWarmupFrames + AnimFrames;
 
 	GRecordSession.Reset();
 	GRecordSession.bActive         = true;
+	GRecordSession.WarmupFrames    = BedlamWarmupFrames;
+	GRecordSession.AnimFrames      = AnimFrames;
 	GRecordSession.TargetFrames    = TargetFrames;
+	GRecordSession.bAnimStarted    = false;
 	GRecordSession.NumFrames       = NumFrames;
 	GRecordSession.CachePath       = CachePath;
 	GRecordSession.CacheName       = CacheName;
@@ -1013,6 +1150,6 @@ void FBedlamClothSetupCommands::RecordChaosCache(const TArray<FString>& Args, UW
 	GEditor->RequestPlaySession(PlayParams);
 
 	UE_LOG(LogBedlamCloth, Log,
-		TEXT("SUCCESS (Step 2): PIE requested. Will record %d frames (NumFrames=%d, AnimLength=%.3fs @ %.0ffps) then auto-end."),
-		TargetFrames, NumFrames, AnimLength, BedlamRecordFrameRate);
+		TEXT("SUCCESS: PIE requested. Will record %d frames (%d warmup + %d anim, AnimLength=%.3fs @ %.0ffps) then auto-end."),
+		TargetFrames, BedlamWarmupFrames, AnimFrames, AnimLength, BedlamRecordFrameRate);
 }

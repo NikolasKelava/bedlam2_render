@@ -264,6 +264,14 @@ This split keeps the architecture consistent with bedlam2_render's existing Pyth
 
 ### C++ Plugin: `BedlamClothSetup`
 
+> **AS-BUILT REFERENCE (read this first):** the plugin is implemented and the four
+> console commands work. The canonical, up-to-date documentation — command API,
+> the actual cloth Dataflow graph, the asynchronous PIE-based `RecordChaosCache`
+> lifecycle, how to call the commands from Python (incl. the async caveat), the
+> build command, and known footguns — lives in
+> `unreal/cloth_simulation/cloth_simulation/Plugins/BedlamClothSetup/README.md`.
+> The sections below are the original design spec and may differ from as-built.
+
 #### Plugin Structure
 ```
 Plugins/BedlamClothSetup/
