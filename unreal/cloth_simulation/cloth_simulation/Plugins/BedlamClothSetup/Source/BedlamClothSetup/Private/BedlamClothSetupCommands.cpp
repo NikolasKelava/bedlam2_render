@@ -15,12 +15,31 @@
 
 // Chaos Cloth Asset
 #include "ChaosClothAsset/ClothAsset.h"
+#include "ChaosClothAsset/ClothComponent.h"
+
+// Chaos Caching
+#include "Chaos/CacheManagerActor.h"
+#include "Chaos/CacheCollection.h"
+
+// Scene / actors for cache recording
+#include "Editor.h"
+#include "Editor/EditorEngine.h"
+#include "PlayInEditorDataTypes.h"
+#include "Engine/World.h"
+#include "Animation/SkeletalMeshActor.h"
+#include "Components/SkeletalMeshComponent.h"
+#include "Animation/AnimSequence.h"
+#include "AssetRegistry/AssetRegistryModule.h"
+#include "Containers/Ticker.h"
+#include "Misc/App.h"
 
 // Chaos Cloth Dataflow Nodes
 #include "ChaosClothAsset/StaticMeshImportNode.h"
 #include "ChaosClothAsset/TransferSkinWeightsNode.h"
 #include "ChaosClothAsset/SetPhysicsAssetNode.h"
 #include "ChaosClothAsset/SimulationMaxDistanceConfigNode.h"
+#include "ChaosClothAsset/SimulationStretchConfigNode.h"
+#include "ChaosClothAsset/SimulationBendingConfigNode.h"
 #include "ChaosClothAsset/SimulationGravityConfigNode.h"
 #include "ChaosClothAsset/SimulationCollisionConfigNode.h"
 #include "ChaosClothAsset/SimulationSelfCollisionConfigNode.h"
@@ -153,22 +172,23 @@ void FBedlamClothSetupCommands::CreateClothAsset(const TArray<FString>& Args, UW
 	auto TransferNode       = CreateDataflowNode(*Graph, DataflowAsset, FName("FChaosClothAssetTransferSkinWeightsNode"),            FName("TransferWeights"));
 	auto PhysAssetNode      = CreateDataflowNode(*Graph, DataflowAsset, FName("FChaosClothAssetSetPhysicsAssetNode"),                FName("SetPhysAsset"));
 	auto MaxDistNode        = CreateDataflowNode(*Graph, DataflowAsset, FName("FChaosClothAssetSimulationMaxDistanceConfigNode"),    FName("MaxDist"));
+	auto StretchNode        = CreateDataflowNode(*Graph, DataflowAsset, FName("FChaosClothAssetSimulationStretchConfigNode"),        FName("Stretch"));
+	auto BendingNode        = CreateDataflowNode(*Graph, DataflowAsset, FName("FChaosClothAssetSimulationBendingConfigNode"),        FName("Bending"));
 	auto GravityNode        = CreateDataflowNode(*Graph, DataflowAsset, FName("FChaosClothAssetSimulationGravityConfigNode"),        FName("Gravity"));
 	auto CollisionNode      = CreateDataflowNode(*Graph, DataflowAsset, FName("FChaosClothAssetSimulationCollisionConfigNode"),      FName("Collision"));
-	auto SelfCollisionNode  = CreateDataflowNode(*Graph, DataflowAsset, FName("FChaosClothAssetSimulationSelfCollisionConfigNode_v2"), FName("SelfCollision"));
 	auto DampingNode        = CreateDataflowNode(*Graph, DataflowAsset, FName("FChaosClothAssetSimulationDampingConfigNode"),        FName("Damping"));
 	auto SolverNode         = CreateDataflowNode(*Graph, DataflowAsset, FName("FChaosClothAssetSimulationSolverConfigNode"),         FName("Solver"));
 	auto TerminalNode       = CreateDataflowNode(*Graph, DataflowAsset, FName("FChaosClothAssetTerminalNode_v2"),       FName("Terminal"));
 
 	if (!ImportNode || !TransferNode || !PhysAssetNode || !MaxDistNode ||
-		!GravityNode || !CollisionNode || !SelfCollisionNode || !DampingNode ||
-		!SolverNode || !TerminalNode)
+		!StretchNode || !BendingNode || !GravityNode || !CollisionNode ||
+		!DampingNode || !SolverNode || !TerminalNode)
 	{
 		UE_LOG(LogBedlamCloth, Error, TEXT("One or more Dataflow nodes failed to create. Aborting."));
 		return;
 	}
 
-	UE_LOG(LogBedlamCloth, Log, TEXT("All 10 Dataflow nodes created."));
+	UE_LOG(LogBedlamCloth, Log, TEXT("All 11 Dataflow nodes created."));
 
 	// -----------------------------------------------------------------------
 	// 4. Set node properties
@@ -193,26 +213,35 @@ void FBedlamClothSetupCommands::CreateClothAsset(const TArray<FString>& Args, UW
 		Typed->PhysicsAsset = PhysAsset;
 	}
 
-	// Max distance — default all-dynamic (large range so all vertices can move freely)
+	// Max distance — small range so the garment stays close to (hugs) the body
+	// instead of drifting metres away. Low is the value used when there is no
+	// weight map; set both Low and High so the limit is small regardless.
 	{
 		auto* Typed = static_cast<FChaosClothAssetSimulationMaxDistanceConfigNode*>(MaxDistNode.Get());
-		Typed->MaxDistance.Low  = 0.f;
-		Typed->MaxDistance.High = 1000.f;
+		Typed->MaxDistance.Low  = 4.f;
+		Typed->MaxDistance.High = 4.f;
 	}
 
-	// Gravity, Collision, SelfCollision, Damping, Solver — use UE defaults
+	// Stretch & Bending — use defaults (PBD, stiffness 1.0). These give the cloth
+	// structural integrity (resistance to stretching and folding). Without these
+	// config nodes there are no such constraints and the mesh deforms without limit.
+
+	// Gravity, Collision, Damping, Solver — use UE defaults.
+	// Self-collision intentionally omitted: it is the dominant cost on this dense
+	// (~36k particle) sim mesh and can be re-introduced once the sim is validated.
 
 	// -----------------------------------------------------------------------
 	// 5. Connect the node chain via Collection passthrough
 	// -----------------------------------------------------------------------
-	ConnectCollectionPins(*Graph, ImportNode,        TransferNode);
-	ConnectCollectionPins(*Graph, TransferNode,      PhysAssetNode);
-	ConnectCollectionPins(*Graph, PhysAssetNode,     MaxDistNode);
-	ConnectCollectionPins(*Graph, MaxDistNode,       GravityNode);
-	ConnectCollectionPins(*Graph, GravityNode,       CollisionNode);
-	ConnectCollectionPins(*Graph, CollisionNode,     SelfCollisionNode);
-	ConnectCollectionPins(*Graph, SelfCollisionNode, DampingNode);
-	ConnectCollectionPins(*Graph, DampingNode,       SolverNode);
+	ConnectCollectionPins(*Graph, ImportNode,    TransferNode);
+	ConnectCollectionPins(*Graph, TransferNode,  PhysAssetNode);
+	ConnectCollectionPins(*Graph, PhysAssetNode, MaxDistNode);
+	ConnectCollectionPins(*Graph, MaxDistNode,   StretchNode);
+	ConnectCollectionPins(*Graph, StretchNode,   BendingNode);
+	ConnectCollectionPins(*Graph, BendingNode,   GravityNode);
+	ConnectCollectionPins(*Graph, GravityNode,   CollisionNode);
+	ConnectCollectionPins(*Graph, CollisionNode, DampingNode);
+	ConnectCollectionPins(*Graph, DampingNode,   SolverNode);
 
 	// Solver → Terminal: terminal v2 uses dynamic LOD inputs (not plain "Collection")
 	{
@@ -628,6 +657,194 @@ void FBedlamClothSetupCommands::ConfigureSimulation(const TArray<FString>& Args,
 		AppliedCount, *ClothAssetPath);
 }
 
+// ---------------------------------------------------------------------------
+// State for the asynchronous, PIE-driven Chaos Cache recording session.
+// The RecordChaosCache command assembles the scene then kicks off PIE and
+// returns; the rest of the flow runs through editor PIE delegates + a ticker.
+// ---------------------------------------------------------------------------
+// Pipeline frame rate; the play world is forced to this fixed timestep while
+// recording so each frame advances the body anim and cloth solver by exactly
+// 1/30s. This makes recording deterministic and immune to real-time hitches.
+static constexpr double BedlamRecordFrameRate = 30.0;
+
+struct FBedlamRecordSession
+{
+	bool   bActive      = false;
+	int32  TargetFrames = 0;   // number of fixed-timestep frames to record
+	int32  FrameCount   = 0;   // frames elapsed since PIE started
+	int32  NumFrames    = 0;   // requested frame count (0 = derived from anim length)
+	FString CachePath;
+	FName   CacheName;
+
+	// Fixed-timestep state to restore when the session ends.
+	bool   bSavedUseFixedTimeStep = false;
+	double SavedFixedDeltaTime    = 0.0;
+
+	TWeakObjectPtr<UChaosCacheCollection> CacheCollection;
+	TWeakObjectPtr<AChaosCacheManager>    EditorManager;
+	TWeakObjectPtr<ASkeletalMeshActor>    BodyActor;
+	TWeakObjectPtr<AActor>                ClothActor;
+	TWeakObjectPtr<UAnimSequence>         Anim;
+
+	FDelegateHandle           PostPIEStartedHandle;
+	FDelegateHandle           EndPIEHandle;
+	FTSTicker::FDelegateHandle TickerHandle;
+
+	void Reset() { *this = FBedlamRecordSession(); }
+};
+
+static FBedlamRecordSession GRecordSession;
+
+// Ticker: count fixed-timestep frames and request PIE end once the target is hit.
+// One core-ticker call corresponds to one engine/PIE-world frame, so a real-time
+// hitch costs a single frame rather than the whole budget.
+static bool OnRecordTick(float /*DeltaTime*/)
+{
+	if (!GRecordSession.bActive)
+	{
+		return false; // stop ticking
+	}
+
+	++GRecordSession.FrameCount;
+	if (GRecordSession.FrameCount >= GRecordSession.TargetFrames)
+	{
+		UE_LOG(LogBedlamCloth, Log, TEXT("Record: reached %d/%d frames. Ending PIE."),
+			GRecordSession.FrameCount, GRecordSession.TargetFrames);
+		if (GEditor)
+		{
+			GEditor->RequestEndPlayMap();
+		}
+		GRecordSession.TickerHandle.Reset();
+		return false; // stop ticking
+	}
+	return true; // keep ticking
+}
+
+// PIE has started: the cache manager's BeginPlay has begun recording. Force the
+// play world onto a fixed 1/30s timestep and start the frame-counting ticker.
+static void OnRecordPostPIEStarted(const bool bIsSimulating)
+{
+	if (!GRecordSession.bActive)
+	{
+		return;
+	}
+
+	// The PlayAnimation "playing" state set on the editor-world body does not
+	// resume after the editor->PIE world duplication, so the body stays frozen at
+	// frame 0 (which leaves the cloth static). Re-start the animation directly on
+	// the PIE-world body actor.
+	if (ASkeletalMeshActor* EditorBody = GRecordSession.BodyActor.Get())
+	{
+		AActor* SimBody = EditorUtilities::GetSimWorldCounterpartActor(EditorBody);
+		if (ASkeletalMeshActor* SimSkelActor = Cast<ASkeletalMeshActor>(SimBody))
+		{
+			USkeletalMeshComponent* SimComp = SimSkelActor->GetSkeletalMeshComponent();
+			UAnimSequence* Anim = GRecordSession.Anim.Get();
+			if (SimComp && Anim)
+			{
+				SimComp->VisibilityBasedAnimTickOption = EVisibilityBasedAnimTickOption::AlwaysTickPoseAndRefreshBones;
+				SimComp->bEnableUpdateRateOptimizations = false;
+				SimComp->PlayAnimation(Anim, /*bLooping*/ false);
+				UE_LOG(LogBedlamCloth, Log, TEXT("Record: started animation on PIE body '%s'."),
+					*SimSkelActor->GetActorLabel());
+			}
+		}
+		else
+		{
+			UE_LOG(LogBedlamCloth, Warning,
+				TEXT("Record: could not resolve PIE-world body counterpart; animation may not play."));
+		}
+	}
+
+	// Save and override the global timestep so each frame advances exactly 1/30s.
+	GRecordSession.bSavedUseFixedTimeStep = FApp::UseFixedTimeStep();
+	GRecordSession.SavedFixedDeltaTime    = FApp::GetFixedDeltaTime();
+	FApp::SetFixedDeltaTime(1.0 / BedlamRecordFrameRate);
+	FApp::SetUseFixedTimeStep(true);
+
+	GRecordSession.FrameCount = 0;
+	GRecordSession.TickerHandle = FTSTicker::GetCoreTicker().AddTicker(
+		FTickerDelegate::CreateStatic(&OnRecordTick), 0.0f);
+
+	UE_LOG(LogBedlamCloth, Log,
+		TEXT("Record: PIE started. Fixed timestep %.4fs, recording %d frames..."),
+		1.0 / BedlamRecordFrameRate, GRecordSession.TargetFrames);
+}
+
+// PIE has ended. Restore the timestep, tear down delegates/ticker and report.
+// (Step 3 will verify recorded frames and save the cache collection here.)
+static void OnRecordEndPIE(const bool bIsSimulating)
+{
+	if (!GRecordSession.bActive)
+	{
+		return;
+	}
+
+	// Restore the global timestep.
+	FApp::SetUseFixedTimeStep(GRecordSession.bSavedUseFixedTimeStep);
+	FApp::SetFixedDeltaTime(GRecordSession.SavedFixedDeltaTime);
+
+	UE_LOG(LogBedlamCloth, Log,
+		TEXT("Record: PIE ended after %d frames (Step 2). Finalize/save will be added in Step 3."),
+		GRecordSession.FrameCount);
+
+	if (GRecordSession.TickerHandle.IsValid())
+	{
+		FTSTicker::GetCoreTicker().RemoveTicker(GRecordSession.TickerHandle);
+	}
+	FEditorDelegates::PostPIEStarted.Remove(GRecordSession.PostPIEStartedHandle);
+	FEditorDelegates::EndPIE.Remove(GRecordSession.EndPIEHandle);
+
+	GRecordSession.Reset();
+}
+
+// ---------------------------------------------------------------------------
+// Helper: create (or load) a UChaosCacheCollection asset at the given path
+// ---------------------------------------------------------------------------
+static UChaosCacheCollection* CreateOrLoadCacheCollection(const FString& CachePath)
+{
+	// Reuse an existing collection if one is already present at this path
+	if (UChaosCacheCollection* Existing = LoadObject<UChaosCacheCollection>(nullptr, *CachePath))
+	{
+		UE_LOG(LogBedlamCloth, Log, TEXT("Reusing existing CacheCollection at %s"), *CachePath);
+		return Existing;
+	}
+
+	const FString AssetName = FPackageName::GetShortName(CachePath);
+	UPackage* Package = CreatePackage(*CachePath);
+	if (!Package)
+	{
+		UE_LOG(LogBedlamCloth, Error, TEXT("Failed to create package for CacheCollection at %s"), *CachePath);
+		return nullptr;
+	}
+
+	UChaosCacheCollection* Collection = NewObject<UChaosCacheCollection>(
+		Package, *AssetName, RF_Public | RF_Standalone);
+	if (!Collection)
+	{
+		UE_LOG(LogBedlamCloth, Error, TEXT("Failed to create UChaosCacheCollection at %s"), *CachePath);
+		return nullptr;
+	}
+
+	FAssetRegistryModule::AssetCreated(Collection);
+	Collection->MarkPackageDirty();
+	UEditorAssetLibrary::SaveAsset(CachePath, false);
+
+	UE_LOG(LogBedlamCloth, Log, TEXT("Created CacheCollection asset at %s"), *CachePath);
+	return Collection;
+}
+
+// ===========================================================================
+// BedlamCloth.RecordChaosCache
+//
+// STEP 1 (current): assemble the recording scene in the editor world.
+//   - load cloth / body / anim assets
+//   - create the output ChaosCacheCollection asset
+//   - spawn body (ASkeletalMeshActor playing the anim), cloth
+//     (UChaosClothComponent bound to the body), and an AChaosCacheManager
+//     configured to record the cloth component.
+//   No PIE / recording is launched yet (steps 2-4).
+// ===========================================================================
 void FBedlamClothSetupCommands::RecordChaosCache(const TArray<FString>& Args, UWorld* World)
 {
 	if (Args.Num() < 4)
@@ -635,5 +852,167 @@ void FBedlamClothSetupCommands::RecordChaosCache(const TArray<FString>& Args, UW
 		UE_LOG(LogBedlamCloth, Error, TEXT("Usage: BedlamCloth.RecordChaosCache <ClothAssetPath> <BodySKMPath> <AnimPath> <OutputCachePath> [NumFrames]"));
 		return;
 	}
-	UE_LOG(LogBedlamCloth, Log, TEXT("RecordChaosCache called: Cloth=%s Body=%s Anim=%s Cache=%s"), *Args[0], *Args[1], *Args[2], *Args[3]);
+
+	const FString& ClothPath  = Args[0];
+	const FString& BodyPath   = Args[1];
+	const FString& AnimPath   = Args[2];
+	const FString& CachePath  = Args[3];
+	const int32    NumFrames  = (Args.Num() >= 5) ? FCString::Atoi(*Args[4]) : 0;
+
+	UE_LOG(LogBedlamCloth, Log, TEXT("RecordChaosCache: Cloth=%s Body=%s Anim=%s Cache=%s NumFrames=%d"),
+		*ClothPath, *BodyPath, *AnimPath, *CachePath, NumFrames);
+
+	// -----------------------------------------------------------------------
+	// 1. Load source assets
+	// -----------------------------------------------------------------------
+	UChaosClothAsset* ClothAsset = LoadObject<UChaosClothAsset>(nullptr, *ClothPath);
+	if (!ClothAsset)
+	{
+		UE_LOG(LogBedlamCloth, Error, TEXT("Failed to load ChaosClothAsset: %s"), *ClothPath);
+		return;
+	}
+
+	USkeletalMesh* BodyMesh = LoadObject<USkeletalMesh>(nullptr, *BodyPath);
+	if (!BodyMesh)
+	{
+		UE_LOG(LogBedlamCloth, Error, TEXT("Failed to load body SkeletalMesh: %s"), *BodyPath);
+		return;
+	}
+
+	UAnimSequence* AnimSeq = LoadObject<UAnimSequence>(nullptr, *AnimPath);
+	if (!AnimSeq)
+	{
+		UE_LOG(LogBedlamCloth, Error, TEXT("Failed to load animation: %s"), *AnimPath);
+		return;
+	}
+
+	UPhysicsAsset* PhysAsset = BodyMesh->GetPhysicsAsset();
+	UE_LOG(LogBedlamCloth, Log, TEXT("Assets loaded. PhysicsAsset=%s AnimLength=%.3fs"),
+		PhysAsset ? *PhysAsset->GetName() : TEXT("null"), AnimSeq->GetPlayLength());
+
+	// -----------------------------------------------------------------------
+	// 2. Create the output cache collection asset
+	// -----------------------------------------------------------------------
+	UChaosCacheCollection* CacheCollection = CreateOrLoadCacheCollection(CachePath);
+	if (!CacheCollection)
+	{
+		return;
+	}
+
+	// -----------------------------------------------------------------------
+	// 3. Resolve the editor world to assemble the scene in
+	// -----------------------------------------------------------------------
+	UWorld* EditorWorld = GEditor ? GEditor->GetEditorWorldContext().World() : nullptr;
+	if (!EditorWorld)
+	{
+		UE_LOG(LogBedlamCloth, Error, TEXT("No editor world available to assemble the recording scene."));
+		return;
+	}
+
+	// -----------------------------------------------------------------------
+	// 4. Spawn the body actor and play the animation
+	// -----------------------------------------------------------------------
+	ASkeletalMeshActor* BodyActor = EditorWorld->SpawnActor<ASkeletalMeshActor>();
+	if (!BodyActor)
+	{
+		UE_LOG(LogBedlamCloth, Error, TEXT("Failed to spawn body SkeletalMeshActor."));
+		return;
+	}
+	BodyActor->SetActorLabel(TEXT("BedlamCloth_Body"));
+
+	USkeletalMeshComponent* BodyComp = BodyActor->GetSkeletalMeshComponent();
+	BodyComp->SetSkeletalMeshAsset(BodyMesh);
+	BodyComp->PlayAnimation(AnimSeq, /*bLooping*/ false);
+
+	// The actors are typically off-screen from the default PIE camera. Skeletal
+	// meshes default to OnlyTickPoseWhenRendered, which freezes the pose (and the
+	// animation) when not rendered. Force the pose to always tick so the body
+	// animation advances during recording regardless of what the PIE view shows.
+	BodyComp->VisibilityBasedAnimTickOption = EVisibilityBasedAnimTickOption::AlwaysTickPoseAndRefreshBones;
+	BodyComp->bEnableUpdateRateOptimizations = false;
+
+	// -----------------------------------------------------------------------
+	// 5. Spawn the cloth actor + component, bind it to the body
+	// -----------------------------------------------------------------------
+	AActor* ClothActor = EditorWorld->SpawnActor<AActor>();
+	if (!ClothActor)
+	{
+		UE_LOG(LogBedlamCloth, Error, TEXT("Failed to spawn cloth actor."));
+		return;
+	}
+	ClothActor->SetActorLabel(TEXT("BedlamCloth_Cloth"));
+
+	UChaosClothComponent* ClothComp = NewObject<UChaosClothComponent>(ClothActor, TEXT("ClothComponent"));
+	ClothActor->SetRootComponent(ClothComp);
+	ClothComp->RegisterComponent();
+	ClothActor->AddInstanceComponent(ClothComp);
+
+	ClothComp->SetAsset(ClothAsset);
+	ClothComp->VisibilityBasedAnimTickOption = EVisibilityBasedAnimTickOption::AlwaysTickPoseAndRefreshBones;
+	ClothComp->AttachToComponent(BodyComp, FAttachmentTransformRules::SnapToTargetNotIncludingScale);
+	ClothComp->SetLeaderPoseComponent(BodyComp);
+	if (PhysAsset)
+	{
+		ClothComp->AddCollisionSource(BodyComp, PhysAsset);
+	}
+
+	// -----------------------------------------------------------------------
+	// 6. Spawn the cache manager and observe the cloth component (Record mode)
+	// -----------------------------------------------------------------------
+	AChaosCacheManager* CacheManager = EditorWorld->SpawnActor<AChaosCacheManager>();
+	if (!CacheManager)
+	{
+		UE_LOG(LogBedlamCloth, Error, TEXT("Failed to spawn AChaosCacheManager."));
+		return;
+	}
+	CacheManager->SetActorLabel(TEXT("BedlamCloth_CacheManager"));
+
+	const FName CacheName(*(FPackageName::GetShortName(CachePath) + TEXT("_cloth")));
+	CacheManager->CacheCollection = CacheCollection;
+	CacheManager->CacheMode = ECacheMode::Record;
+	CacheManager->bStartOnBeginPlay = true;
+	CacheManager->FindOrAddObservedComponent(ClothComp, CacheName);
+
+	UE_LOG(LogBedlamCloth, Log,
+		TEXT("Scene assembled. Body=%s Cloth=%s Manager=%s Observed=%d CacheName=%s"),
+		*BodyActor->GetActorLabel(), *ClothActor->GetActorLabel(), *CacheManager->GetActorLabel(),
+		CacheManager->GetObservedComponents().Num(), *CacheName.ToString());
+
+	// -----------------------------------------------------------------------
+	// 7. Launch PIE to drive the simulation; auto-end after the target duration
+	// -----------------------------------------------------------------------
+	if (GRecordSession.bActive)
+	{
+		UE_LOG(LogBedlamCloth, Error, TEXT("A record session is already in progress. Aborting."));
+		return;
+	}
+
+	const float AnimLength   = AnimSeq->GetPlayLength();
+	const int32 TargetFrames = (NumFrames > 0)
+		? NumFrames
+		: FMath::CeilToInt(AnimLength * BedlamRecordFrameRate);
+
+	GRecordSession.Reset();
+	GRecordSession.bActive         = true;
+	GRecordSession.TargetFrames    = TargetFrames;
+	GRecordSession.NumFrames       = NumFrames;
+	GRecordSession.CachePath       = CachePath;
+	GRecordSession.CacheName       = CacheName;
+	GRecordSession.CacheCollection = CacheCollection;
+	GRecordSession.EditorManager   = CacheManager;
+	GRecordSession.BodyActor       = BodyActor;
+	GRecordSession.ClothActor      = ClothActor;
+	GRecordSession.Anim            = AnimSeq;
+
+	GRecordSession.PostPIEStartedHandle = FEditorDelegates::PostPIEStarted.AddStatic(&OnRecordPostPIEStarted);
+	GRecordSession.EndPIEHandle         = FEditorDelegates::EndPIE.AddStatic(&OnRecordEndPIE);
+
+	FRequestPlaySessionParams PlayParams;
+	PlayParams.WorldType         = EPlaySessionWorldType::PlayInEditor;
+	PlayParams.SessionDestination = EPlaySessionDestinationType::InProcess;
+	GEditor->RequestPlaySession(PlayParams);
+
+	UE_LOG(LogBedlamCloth, Log,
+		TEXT("SUCCESS (Step 2): PIE requested. Will record %d frames (NumFrames=%d, AnimLength=%.3fs @ %.0ffps) then auto-end."),
+		TargetFrames, NumFrames, AnimLength, BedlamRecordFrameRate);
 }
