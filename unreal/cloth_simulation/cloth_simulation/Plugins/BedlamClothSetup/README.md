@@ -16,13 +16,13 @@ pipeline can stay Python-driven (call them with
 
 ---
 
-## Status (2026-06-01)
+## Status (2026-06-02)
 
 | Command | Status |
 |---|---|
-| `BedlamCloth.CreateClothAsset` | ✅ Working |
-| `BedlamCloth.SetWeightMap` | ⚠️ `all_dynamic` works but is now a footgun (see notes); `auto`/`file` stubbed |
-| `BedlamCloth.ConfigureSimulation` | ✅ Working (see MaxDistance caveat) |
+| `BedlamCloth.CreateClothAsset` | ✅ Working — loosened drape + robust collision defaults (tunable in `BedlamClothDefaults`) |
+| `BedlamCloth.SetWeightMap` | ✅ Working — `all_dynamic` (fixed), `auto` (per-vertex proximity), `file` |
+| `BedlamCloth.ConfigureSimulation` | ✅ Working — MaxDistance is weight-map-aware; `Friction`/`CCD` keys added |
 | `BedlamCloth.RecordChaosCache` | ✅ Complete — PIE-based, warmup/settle frames, auto-save, auto-cleanup |
 
 ---
@@ -65,14 +65,34 @@ graph, and saves both. Sets the cloth asset's skeleton and physics asset from th
 The Dataflow graph it builds (Collection passthrough chain):
 ```
 Import(StaticMesh) → TransferSkinWeights(from body) → SetPhysicsAsset
-  → MaxDistance(4cm) → Stretch(PBD) → Bending(PBD) → Gravity → Collision → Damping → Solver → Terminal
+  → MaxDistance → Stretch(PBD) → Bending(PBD) → Gravity → Collision → Damping → Solver → Terminal
 ```
+
+**All the tunable numbers live in one place — the `BedlamClothDefaults` namespace
+at the top of `BedlamClothSetupCommands.cpp`.** Edit those constants and rebuild
+to change the baked-in behaviour; most can also be overridden per-asset afterwards
+with `ConfigureSimulation` / `SetWeightMap`. Current defaults:
+
+| Constant | Default | Meaning |
+|---|---|---|
+| `MaxDistanceCm` | 10 | How far a particle may drift from its skinned body position. Main knob for "cloth sticks to body/hand": small = rigid hug, large = flowing drape. Stay ~8–15. |
+| `StretchStiffness` | 1.0 | PBD stretch [0,1]; keep high so the garment doesn't visibly stretch. |
+| `BendingStiffness` | 0.3 | PBD bending [0,1]; lower = floppier, more natural folds. |
+| `DampingCoefficient` | 0.01 | Global point damping [0,1]. |
+| `CollisionThicknessCm` | 1.0 | Added thickness of body collision shapes. |
+| `FrictionCoefficient` | 0.8 | Cloth↔body grip (slides off less when higher). |
+| `bUseContinuousCollision` | true | CCD — stops fast cloth tunnelling through the thin capsule collision. |
+
 Key points:
 - **Stretch + Bending** config nodes give the cloth structural integrity. Without
   them the mesh stretches without limit and flies apart.
-- **MaxDistance Low=High=4cm** anchors the garment to the body (hugs within 4 cm).
-  For these weighted-value configs *without a weight map, only `.Low` is used* —
-  so Low and High are both set.
+- **MaxDistance** anchors the garment to the body. For these weighted-value
+  configs *without a weight map only `.Low` is used*, so CreateClothAsset sets
+  `Low == High` (uniform). `SetWeightMap auto/file` later paints a per-vertex map
+  and switches to `Low=0` (kinematic) … `High` (dynamic) — see below.
+- **Collision** against the body physics asset is enabled here (thickness +
+  friction + CCD). This prevents the cloth penetrating/tunnelling the body, but it
+  does **not** hold an un-anchored garment up (see `all_dynamic` note).
 - **Self-Collision is intentionally NOT added** (it was the dominant cost on the
   dense ~36k-particle sim mesh, >1 min/frame). Re-add later once validated if
   self-intersection matters.
@@ -82,14 +102,34 @@ Example:
 BedlamCloth.CreateClothAsset /Game/ClothSimulation/Clothing/garment /Game/ClothSimulation/Body/body /Game/ClothSimulation/ClothAssets/CA_garment
 ```
 
-### 2. `BedlamCloth.SetWeightMap <ClothAssetPath> <Mode> [FilePath]`
-Modifies the MaxDistance on an existing cloth asset.
-- `all_dynamic` — sets MaxDistance Low=0, **High=1000**. ⚠️ **Footgun:** this
-  contradicts the 4 cm default from `CreateClothAsset` and will make the garment
-  fly off the body. Do **not** run this on assets built by the current
-  `CreateClothAsset`. (Left intact for legacy/experimental use.)
-- `auto` — **stubbed** (needs per-vertex body-proximity computation).
-- `file` — **stubbed** (needs a WeightMapNode + per-vertex values from a file).
+### 2. `BedlamCloth.SetWeightMap <ClothAssetPath> <Mode> [args]`
+Controls the MaxDistance weight map on an existing cloth asset (per-vertex how far
+the garment may drift from the body). Re-evaluates + saves. Idempotent /
+re-runnable — `auto`/`file` create one `BedlamWeightMap` PaintWeightMap node and
+reuse it on later calls.
+
+| Mode | Args | Effect |
+|---|---|---|
+| `all_dynamic` | — | Uniform `Low=High=1000` (effectively unconstrained). **Removes all kinematic anchoring → the garment is free and will sag/fall off the body.** Mainly a debug state; re-pin with `auto`. (Footgun fixed: the old `Low=0/High=1000` made everything *kinematic*, the opposite.) |
+| `auto` | `<BodySKMPath> [ThresholdCm] [BandCm]` | Per-vertex proximity to the body. Sim vertices within `Threshold` (default 2 cm) of the nearest body vertex are kinematic (weight 0 → `Low=0`); past `Threshold+Band` (default +8 cm) fully dynamic (weight 1 → `High=20`); linear ramp between. Logs kinematic % and mean distance. |
+| `file` | `<FilePath>` | Per-vertex weights `0..1`, one per sim vertex (comma/whitespace/newline separated; clamped; padded/truncated with a warning). `Low=0 … High=20`. |
+
+How it works: a generic `FDataflowCollectionAddScalarVertexPropertyNode`
+("PaintWeightMap") is spliced into the chain just before MaxDistance and writes a
+float attribute named `"MaxDistance"` into the `SimVertices3D` group — the same
+name the MaxDistance config reads, so the cloth facade picks it up as a weight map.
+
+`auto` needs the garment and body to share a coordinate space (the co-authored
+test FBXs do). The diagnostic log line is the tell — a sane `meanDist` of a few cm
+means they line up; a huge value (or `Kinematic≈100%`) means misalignment or a
+`Threshold` that's too large.
+
+Examples:
+```
+BedlamCloth.SetWeightMap /Game/ClothSimulation/ClothAssets/CA_garment auto /Game/ClothSimulation/Body/body
+BedlamCloth.SetWeightMap /Game/ClothSimulation/ClothAssets/CA_garment auto /Game/ClothSimulation/Body/body 3 10
+BedlamCloth.SetWeightMap /Game/ClothSimulation/ClothAssets/CA_garment file C:/weights/garment.txt
+```
 
 ### 3. `BedlamCloth.ConfigureSimulation <ClothAssetPath> [Key=Value ...]`
 Updates config-node properties on an existing cloth asset, then re-evaluates+saves.
@@ -100,18 +140,23 @@ Recognized keys:
 | `Damping` | Damping coefficient 0–1 (Low=High) |
 | `Substeps` | Solver substeps (int) |
 | `Iterations` | Solver iterations (int) |
-| `MaxDistance` | Sets MaxDistance Low=**0**, High=value. ⚠️ With no weight map only `.Low` is used → value of 0 makes the cloth kinematic. Inconsistent with CreateClothAsset (which sets Low=High). Prefer not to use until fixed; see Future Work. |
-| `CollisionThickness` | Collision thickness (float) |
+| `MaxDistance` | **Weight-map-aware.** If a `SetWeightMap auto/file` map is active, sets the dynamic `High`=value and keeps the kinematic `Low=0` (preserves the painted anchoring; also recovers an asset a prior `all_dynamic` had loosened). Otherwise sets a uniform `Low=High`=value. |
+| `CollisionThickness` | Added collision thickness, cm |
+| `Friction` | Cloth↔body friction (Low=High); higher = grips the body more |
+| `CCD` | `true`/`false` — continuous collision detection (anti-tunnelling) |
 | `SelfCollision` | No-op in practice — the SelfCollision node is no longer in the default graph. |
 
 Example:
 ```
 BedlamCloth.ConfigureSimulation /Game/ClothSimulation/ClothAssets/CA_garment Gravity=1.0 Damping=0.1 Iterations=30
+BedlamCloth.ConfigureSimulation /Game/ClothSimulation/ClothAssets/CA_garment MaxDistance=10 Friction=0.9 CCD=true
 ```
 
 ### 4. `BedlamCloth.RecordChaosCache <ClothAssetPath> <BodySKMPath> <AnimPath> <OutputCachePath> [NumFrames]`
 Records a `UChaosCacheCollection` of the cloth simulating on the animated body.
-**Asynchronous** — see [§ Calling from Python](#calling-from-python).
+**Asynchronous** — it returns before the recording finishes. Poll the
+`<cache>.recordstatus` marker file for completion; see
+[§ Calling from Python](#calling-from-python).
 
 `NumFrames` (optional) = number of **animation** frames to record; `0`/omitted
 derives it from the animation length at 30 fps. Warmup frames are added on top.
@@ -147,8 +192,10 @@ Sequence:
    settles onto the body), then `Play()` the body animation; once
    `warmup + anim` frames are reached → `RequestEndPlayMap()`.
 5. **On `EndPIE`:** restore the timestep and schedule a **one-tick-deferred**
-   finalize that verifies `NumRecordedFrames`, saves the collection asset, and
-   destroys the temporary actors.
+   finalize that verifies `NumRecordedFrames`, saves the collection asset, destroys
+   the temporary actors, and writes the `DONE`/`FAILED` line to the
+   `<cache>.recordstatus` marker (the `RECORDING` line was written just before PIE
+   launched; the marker was cleared at the start of the command).
 
 Resulting cache = `30 warmup/settle frames` + `anim frames` (e.g. 30 + 130 = 160).
 The warmup frames can be discarded by the post/MRQ warmup step.
@@ -190,36 +237,86 @@ run("BedlamCloth.CreateClothAsset /Game/ClothSimulation/Clothing/garment "
 run("BedlamCloth.ConfigureSimulation /Game/ClothSimulation/ClothAssets/CA_garment Iterations=30")
 ```
 
-### ⚠️ RecordChaosCache is asynchronous
+### ⚠️ RecordChaosCache is asynchronous — poll the status marker
 `execute_console_command("BedlamCloth.RecordChaosCache ...")` **returns immediately** —
 it only *requests* PIE. The actual recording runs across subsequent editor frames
 and finishes when PIE ends (the deferred finalize then saves the cache). A Python
 orchestrator that calls it and immediately proceeds will race the recording.
 
-To sequence multiple recordings or post-steps, **wait for the cache to be saved /
-PIE to end** before continuing, e.g.:
-- Subscribe to end-of-PIE from Python: `unreal.register_python_shutdown_callback`
-  is not it — use `unreal.EditorLevelLibrary`/editor tick polling, or poll
-  `unreal.EditorAssetLibrary.does_asset_exist(<cache_path>)` **and** that PIE is no
-  longer running, then proceed; or
-- Drive one record per editor "session"/tick loop and gate the next call on the
-  `SUCCESS (Step 3): recording finished ...` log / cache asset modification.
+**Completion signal — a status marker file next to the cache.** The command writes
+a one-line text file `<cache>.recordstatus` on disk (same folder as the cache
+`.uasset`), whose content is one of:
+```
+RECORDING
+DONE   frames=<N> duration=<sec> cache=<LongPackageName>
+FAILED reason=<text>
+```
+Lifecycle: the marker is **deleted** at the start of every `RecordChaosCache` call,
+set to `RECORDING` right before PIE launches, then flipped to `DONE`/`FAILED` by the
+deferred finalize when recording ends. So:
+- marker **absent** after the call returned → the command failed *synchronously*
+  (bad asset path, etc.) — check the log;
+- marker `RECORDING` → in progress;
+- marker starts with `DONE` / `FAILED` → finished (success / failure).
 
-A clean future enhancement (see below) is to expose a queryable "record complete"
-flag or a follow-up console command so Python can poll a single boolean.
+Map the cache package path to the marker file: for `/Game/ClothSimulation/Cache/CC_garment`
+it is `<ProjectContentDir>/ClothSimulation/Cache/CC_garment.recordstatus`
+(`unreal.Paths.project_content_dir()` + the sub-path under `/Game`). The absolute
+path is also logged on launch (`... Poll completion via status marker: <path>`).
 
-All `RecordChaosCache` progress is logged under the `LogBedlamCloth` category; the
-final lines are `Record: cache '<name>' recorded <N> frames ... Saved=OK` and
+> **Do NOT busy-wait from editor Python.** Python in the editor runs on the **game
+> thread**; a blocking `while: sleep` loop would stop PIE from ticking and the
+> recording would never progress (deadlock). Poll from a non-blocking context:
+
+```python
+import os, unreal
+
+def marker_path(cache_pkg):  # "/Game/Foo/CC" -> "<Content>/Foo/CC.recordstatus"
+    rel = cache_pkg[len("/Game/"):]
+    return os.path.join(unreal.Paths.project_content_dir(), rel + ".recordstatus")
+
+CACHE = "/Game/ClothSimulation/Cache/CC_garment"
+MARKER = marker_path(CACHE)
+
+unreal.SystemLibrary.execute_console_command(
+    unreal.EditorLevelLibrary.get_editor_world(),
+    f"BedlamCloth.RecordChaosCache /Game/ClothSimulation/ClothAssets/CA_garment "
+    f"/Game/ClothSimulation/Body/body /Game/ClothSimulation/Body/body_Anim {CACHE}")
+
+# Non-blocking poll via a slate post-tick callback (does not stall PIE):
+_handle = None
+def _poll(dt):
+    global _handle
+    try:
+        status = open(MARKER).read().strip() if os.path.exists(MARKER) else ""
+    except OSError:
+        return  # mid-write; try again next tick
+    if status.startswith(("DONE", "FAILED")):
+        unreal.unregister_slate_post_tick_callback(_handle)
+        unreal.log(f"record finished: {status}")
+        # ...kick off the next record / post-step here...
+_handle = unreal.register_slate_post_tick_callback(_poll)
+```
+An external process (outside the editor) can just `os.path.exists` / read the marker
+in a normal sleep-loop — it isn't on the game thread.
+
+All `RecordChaosCache` progress is also logged under the `LogBedlamCloth` category;
+the final lines are `Record: cache '<name>' recorded <N> frames ... Saved=OK` and
 `SUCCESS (Step 3): recording finished after <N> frames`.
 
 ---
 
 ## Known limitations / footguns
-- `SetWeightMap all_dynamic` and `ConfigureSimulation MaxDistance=…` both write a
-  MaxDistance range that is **inconsistent** with the `CreateClothAsset` default
-  (which sets Low=High=4 cm). Using them can re-break the cloth (fly-away or fully
-  kinematic). Until fixed, configure MaxDistance only via `CreateClothAsset`.
-- `SetWeightMap auto` / `file` are stubs (log a warning, do nothing).
+- **Collision holds nothing up.** Collision against the body physics asset is
+  always on (thickness/friction/CCD), but it only prevents penetration. The thing
+  that *keeps the garment on the body* is MaxDistance anchoring. `SetWeightMap
+  all_dynamic` removes that anchoring, so the garment sags/falls off (collision
+  can't catch a fully un-anchored shirt on coarse capsules). This is expected — for
+  a wearable result keep some anchoring (`auto`/`file`, or a finite uniform
+  `MaxDistance`). CCD/thickness reduce "falling through" but don't change this.
+- `SetWeightMap auto` assumes the garment and body imported into the **same
+  coordinate space**. Check the `meanDist` diagnostic; a huge value means
+  misalignment and the weights will be meaningless.
 - Self-collision is disabled by default (performance on the dense sim mesh).
 - The garment is imported at full render resolution as the sim mesh (~36k
   particles) — no decimation yet; simulation cost scales with this.
@@ -227,9 +324,6 @@ final lines are `Record: cache '<name>' recorded <N> frames ... Saved=OK` and
   auto-cleared on the next `RecordChaosCache` call.
 
 ## Future work
-- Make `SetWeightMap`/`ConfigureSimulation` MaxDistance set `Low == High` (consistent
-  with CreateClothAsset); implement `auto`/`file` weight-map modes.
 - Optional self-collision re-enable (arg or config key) + sim-mesh decimation.
-- Expose record FPS and a Python-pollable "record complete" signal (today: poll the
-  log/cache asset + PIE state).
+- Expose record FPS as an argument.
 - Integrate into the main BEDLAM2 pipeline (replace CLO3D GeometryCache clothing).
