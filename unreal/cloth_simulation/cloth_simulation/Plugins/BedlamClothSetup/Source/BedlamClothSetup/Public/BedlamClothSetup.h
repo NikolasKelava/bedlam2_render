@@ -15,4 +15,5 @@ private:
 	IConsoleCommand* CmdSetWeightMap = nullptr;
 	IConsoleCommand* CmdConfigureSimulation = nullptr;
 	IConsoleCommand* CmdRecordChaosCache = nullptr;
+	IConsoleCommand* CmdShowGraph = nullptr;
 };

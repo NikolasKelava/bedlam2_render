@@ -34,7 +34,14 @@ void FBedlamClothSetupModule::StartupModule()
 		ECVF_Default
 	);
 
-	UE_LOG(LogTemp, Log, TEXT("BedlamClothSetup: 4 console commands registered."));
+	CmdShowGraph = IConsoleManager::Get().RegisterConsoleCommand(
+		TEXT("BedlamCloth.ShowGraph"),
+		TEXT("Rebuild the visual Dataflow graph for a script-created cloth asset so its nodes are visible in the editor. Args: <ClothAssetPath>"),
+		FConsoleCommandWithWorldAndArgsDelegate::CreateStatic(&FBedlamClothSetupCommands::ShowGraph),
+		ECVF_Default
+	);
+
+	UE_LOG(LogTemp, Log, TEXT("BedlamClothSetup: 5 console commands registered."));
 }
 
 void FBedlamClothSetupModule::ShutdownModule()
@@ -43,6 +50,7 @@ void FBedlamClothSetupModule::ShutdownModule()
 	if (CmdSetWeightMap)       IConsoleManager::Get().UnregisterConsoleObject(CmdSetWeightMap);
 	if (CmdConfigureSimulation) IConsoleManager::Get().UnregisterConsoleObject(CmdConfigureSimulation);
 	if (CmdRecordChaosCache)   IConsoleManager::Get().UnregisterConsoleObject(CmdRecordChaosCache);
+	if (CmdShowGraph)          IConsoleManager::Get().UnregisterConsoleObject(CmdShowGraph);
 }
 
 #undef LOCTEXT_NAMESPACE

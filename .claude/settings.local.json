@@ -39,7 +39,9 @@
       "Bash(find \"C:/Users/Nikolas Kelava/.claude\" -name \"lucky-orbiting-crystal.md\" 2>/dev/null; echo \"---try home---\"; find ~ -name \"lucky-orbiting-crystal.md\" 2>/dev/null | head)",
       "Bash(Get-ChildItem -Path \"C:\\\\Program Files\\\\Epic Games\\\\UE_5.7\\\\Engine\\\\Source\\\\Editor\\\\UnrealEd\\\\Classes\" -Name \"*Editor*\" -Type f)",
       "Bash(find \"C:\\\\Program Files\\\\Epic Games\\\\UE_5.7\" -path \"*/UnrealEd/Classes/Editor/EditorEngine.h\" 2>/dev/null)",
-      "Bash(find \"C:\\\\Program Files\\\\Epic Games\\\\UE_5.7\" -path \"*EditorEngine.h\" 2>/dev/null | head -5)"
+      "Bash(find \"C:\\\\Program Files\\\\Epic Games\\\\UE_5.7\" -path \"*EditorEngine.h\" 2>/dev/null | head -5)",
+      "Bash(find \"/c/Program Files/Epic Games/UE_5.7/Engine\" -iname \"*.h\" 2>/dev/null | grep -i \"DataflowEdNode\\\\|DataflowSchema\\\\|DataflowGraphSchema\" | head -50)",
+      "PowerShell(& \"C:\\\\Program Files\\\\Epic Games\\\\UE_5.7\\\\Engine\\\\Build\\\\BatchFiles\\\\Build.bat\" cloth_simulationEditor Win64 Development -Project=\"C:\\\\Users\\\\Nikolas Kelava\\\\Documents\\\\BEDLAM3\\\\bedlam2_render\\\\unreal\\\\cloth_simulation\\\\cloth_simulation\\\\cloth_simulation.uproject\" -WaitMutex)"
     ]
   }
 }

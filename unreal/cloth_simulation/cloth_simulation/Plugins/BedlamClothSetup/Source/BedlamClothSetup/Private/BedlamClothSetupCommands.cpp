@@ -12,6 +12,7 @@
 #include "Dataflow/DataflowNode.h"
 #include "Dataflow/DataflowNodeFactory.h"
 #include "Dataflow/DataflowBlueprintLibrary.h"
+#include "Dataflow/DataflowEdNode.h"   // UDataflowEdNode (make script-built nodes visible in the editor)
 
 // Chaos Cloth Asset
 #include "ChaosClothAsset/ClothAsset.h"
@@ -77,27 +78,67 @@ DEFINE_LOG_CATEGORY_STATIC(LogBedlamCloth, Log, All);
 namespace BedlamClothDefaults
 {
 	// How far (cm) a cloth particle may drift from its skinned position on the
-	// body (MaxDistance). This is the main knob for the "cloth sticks to the
-	// body / to a passing hand" problem:
-	//   - smaller (e.g. the old 4 cm) hugs the body rigidly, so the garment
-	//     gets dragged along by anything it touches (a hand brushing it sticks);
-	//   - larger lets the garment hang/swing and fall away naturally.
-	// Stay within ~8-15 cm: too large and the garment drifts/flies off the body.
-	static constexpr float MaxDistanceCm = 10.f;
+	// body (MaxDistance). Main knob for how much the garment DRAPES / hangs away
+	// from the body:
+	//   - smaller hugs the body more tightly: less drape, less waving, and less
+	//     opportunity to drift into/through the body;
+	//   - larger lets the garment hang/swing further out and flow more freely.
+	// Stay within ~4-12 cm: too large and the garment looks loose/rubbery and can
+	// drift off the body. (Note: this does NOT cause cloth to follow a wrong limb
+	// — that earlier "garment dragged by the hand" artifact was a skin-weight
+	// binding bug, kinematic verts bound to the hand bone instead of the leg bone,
+	// fixed in the transfer step, not here.)
+	static constexpr float MaxDistanceCm = 5.f;
 
 	// PBD stretch stiffness, internally clamped to [0,1]. Keep high so the
 	// garment does not visibly stretch; 1.0 = effectively inextensible.
 	static constexpr float StretchStiffness = 1.f;
 
 	// PBD bending stiffness, internally clamped to [0,1]. Lower = floppier, more
-	// natural folds and drape; higher (1.0) = stiff, card-like. Lowered from the
-	// node default of 1.0 so the cloth flows rather than moving as a rigid shell.
-	static constexpr float BendingStiffness = 0.5f;
+	// natural folds and drape; higher (1.0) = stiff, card-like. Raised back up so
+	// the garment stops "waving" / flapping like a loose rubber sheet and holds
+	// firmer folds. Drop toward 0.5 if it looks too card-stiff.
+	static constexpr float BendingStiffness = 0.8f;
 
-	// Global velocity (point) damping [0,1]. Small values keep the cloth lively;
-	// larger values slow it down and can read as sluggish/sticky. 0.01 is the UE
-	// default and a good starting point.
-	static constexpr float DampingCoefficient = 0.01f;
+	// Global velocity (point) damping [0,1]. Small values keep the cloth lively but
+	// also let it oscillate/wave and read as rubbery; larger values bleed off that
+	// motion so it settles. Raised well above the 0.01 UE default specifically to
+	// kill the rubbery bouncing/waving. Lower toward ~0.05 if it looks sluggish.
+	static constexpr float DampingCoefficient = 0.1f;
+
+	// --- Gravity --------------------------------------------------------------
+	// Gravity scale (multiplier on world gravity); 1.0 = full gravity. This is the
+	// knob that DECOUPLES drape from leg-collision, which MaxDistance alone cannot:
+	//   - MaxDistance (High) = how far the cloth CAN move — it must stay large enough
+	//     (~20) for a stepping leg to push the skirt aside, or the hard MaxDistance
+	//     constraint yanks the cloth back into the leg (leg passes through);
+	//   - GravityScale = how hard it's pulled down, i.e. how much of that headroom is
+	//     actually spent sagging. Lower gravity = less downward drape WITHOUT shrinking
+	//     the collision headroom.
+	// Lowered to 0.5 because at the leg-safe MaxDistance (~20) full-ish gravity drapes
+	// the skirt all the way to that cap. Range ~0.4-0.7: lower if it still drapes too
+	// far, higher if it looks unnaturally floaty/stiff.
+	static constexpr float GravityScale = 0.5f;
+
+	// --- Solver ---------------------------------------------------------------
+	// Solver substeps per frame. Each substep re-evaluates body collision with the
+	// collider position interpolated within the frame, so MORE substeps is the main
+	// fix for a fast-moving limb (e.g. a leg stepping forward) punching through the
+	// garment and ending up on the wrong side between frames. Combined with CCD this
+	// is the lever against "the leg passes through the dress". Recording is offline,
+	// so the extra cost per substep is acceptable. Raised to 5 because body
+	// penetration persisted at 3; go higher (8+) if it still tunnels on fast motion.
+	static constexpr int32 SolverSubsteps = 5;
+
+	// Solver (constraint) iterations. Higher = stiffer, more stable constraint +
+	// collision resolution, so the cloth holds its shape and resists being pushed
+	// through the body. NOTE: the solver node has TWO fields — NumIterations (the
+	// count at 60fps) AND MaxNumIterations (a hard cap, node default only 6).
+	// NumIterations is clamped to MaxNumIterations, so we MUST set both or the
+	// effective count silently stays at 6 (this was a real bug — the sim ran at 6
+	// iterations and limbs punched through). CreateClothAsset/ConfigureSimulation set
+	// both to this value.
+	static constexpr int32 SolverIterations = 40;
 
 	// --- Collision (applies to every mode) ------------------------------------
 	// Collision against the body's physics asset is always on (the cloth solver's
@@ -110,7 +151,11 @@ namespace BedlamClothDefaults
 	// wearable result.
 	//
 	// Added thickness (cm) of the body collision shapes; larger = caught a little
-	// further from the surface (fewer gaps), at the cost of a looser-looking drape.
+	// further from the surface (fewer gaps / less limb poke-through) but a puffier,
+	// offset-looking drape. Back to 1.0 — it reads as the most natural, and the
+	// earlier bump to 2.0 was chasing limb poke-through that was actually a MISSING
+	// PHYSICS ASSET (no colliders at all), not a too-thin collision. With a real
+	// physics asset present, 1.0 is enough.
 	static constexpr float CollisionThicknessCm = 1.0f;
 	// Cloth<->body friction; higher = grips the body more (slides off less).
 	static constexpr float FrictionCoefficient = 0.8f;
@@ -128,6 +173,19 @@ namespace BedlamClothDefaults
 	// MaxDistance between these two: weight 0 -> Low (kinematic/pinned to body),
 	// weight 1 -> High (free to drift up to this many cm).
 	static constexpr float WeightMapKinematicLowCm = 0.f;
+	// High is the FREEDOM (cm) of the loose region (e.g. a dress skirt): how far it
+	// may drift from its skinned target. This is the main "drape vs. stretchy/flies
+	// away" knob once collision works:
+	//   - too large (the temporary 50 cm) -> the skirt drifts far from the body, which
+	//     reads as a stretchy, heavy fabric, and tiny forces fling it around ("thin,
+	//     flies away easily");
+	//   - too small -> the skirt is tethered tight to the body and can't swing.
+	// IMPORTANT: with a real physics asset present, collision (not MaxDistance) is
+	// what keeps the skirt off the legs, so High does NOT need to be big enough to
+	// "clear a leg" — keep it modest for a fabric-like look. ~15-25 cm. Pair with a
+	// weight map that pins only the waist (SetWeightMap auto). NOTE: changing this
+	// only affects the NEXT SetWeightMap auto/file run; to apply it to an existing
+	// asset use ConfigureSimulation MaxDistance=<cm> (weight-map-aware).
 	static constexpr float WeightMapDynamicHighCm  = 20.f;
 
 	// "auto" proximity ramp (cm): sim vertices within Threshold of the body are
@@ -185,6 +243,91 @@ static bool ConnectCollectionPins(
 	return false;
 }
 
+// ---------------------------------------------------------------------------
+// Helper: make the script-built graph VISIBLE in the Dataflow editor.
+//
+// Creating nodes via FNodeFactory only builds the *runtime* graph
+// (UE::Dataflow::FGraph of FDataflowNode). The Dataflow asset editor draws
+// UEdGraphNode visual counterparts (UDataflowEdNode, stored on the UDataflow
+// which IS a UEdGraph). Because we never created those, a script-built asset
+// opens as an EMPTY graph (and logs the cosmetic "no UEdGraphNode" ensure on
+// load). This mirrors the engine's own creation path
+// (DataflowAssetEditUtils.cpp CreateDataflowEdNode): for every runtime node that
+// has no visual node yet, spawn a UDataflowEdNode bound to it by GUID, allocate
+// its pins, lay it out in a row, then rebuild all the visual connections from the
+// runtime graph. Idempotent — re-running only adds nodes that are missing, so it
+// is safe to call after every graph mutation (e.g. SetWeightMap's PaintWeightMap
+// node). The Dataflow editor assigns the graph Schema itself when first opened.
+// ---------------------------------------------------------------------------
+static void SyncEdGraphNodes(UDataflow* DataflowAsset)
+{
+#if WITH_EDITOR
+	if (!DataflowAsset)
+	{
+		return;
+	}
+	TSharedPtr<UE::Dataflow::FGraph> Graph = DataflowAsset->GetDataflow();
+	if (!Graph.IsValid())
+	{
+		return;
+	}
+
+	// Lay out one node per column, left to right, in runtime-node order.
+	const float ColumnSpacing = 360.f;
+	int32 Index = DataflowAsset->Nodes.Num(); // continue after any existing nodes
+	int32 Created = 0;
+
+	for (const TSharedPtr<FDataflowNode>& Node : Graph->GetNodes())
+	{
+		if (!Node.IsValid())
+		{
+			continue;
+		}
+		// Skip runtime nodes that already have a visual counterpart.
+		if (DataflowAsset->FindEdNodeByDataflowNodeGuid(Node->GetGuid()))
+		{
+			continue;
+		}
+
+		UDataflowEdNode* EdNode = NewObject<UDataflowEdNode>(
+			DataflowAsset, UDataflowEdNode::StaticClass(), *Node->GetName().ToString());
+		if (!EdNode)
+		{
+			continue;
+		}
+		EdNode->SetFlags(RF_Transactional);
+		// Bind to the runtime node BEFORE adding so listeners see the GUID.
+		EdNode->SetDataflowGraph(Graph);
+		EdNode->SetDataflowNodeGuid(Node->GetGuid());
+
+		DataflowAsset->AddNode(EdNode, /*bUserAction*/ false, /*bSelectNewNode*/ false);
+
+		EdNode->CreateNewGuid();
+		EdNode->PostPlacedNewNode();
+		EdNode->AllocateDefaultPins();
+
+		EdNode->NodePosX = Index * ColumnSpacing;
+		EdNode->NodePosY = 0;
+		++Index;
+		++Created;
+	}
+
+	// All visual nodes now exist -> rebuild the visual wiring from the runtime
+	// graph (this matches input/output pins by name and links them by node GUID).
+	for (const TObjectPtr<UEdGraphNode>& EdNode : DataflowAsset->Nodes)
+	{
+		if (UDataflowEdNode* DfEdNode = Cast<UDataflowEdNode>(EdNode))
+		{
+			DfEdNode->UpdatePinsConnectionsFromDataflowNode();
+		}
+	}
+
+	UE_LOG(LogBedlamCloth, Log,
+		TEXT("SyncEdGraphNodes: %d visual node(s) created (%d total ed nodes). Graph is now visible in the Dataflow editor."),
+		Created, DataflowAsset->Nodes.Num());
+#endif // WITH_EDITOR
+}
+
 // ===========================================================================
 // BedlamCloth.CreateClothAsset
 // ===========================================================================
@@ -192,13 +335,18 @@ void FBedlamClothSetupCommands::CreateClothAsset(const TArray<FString>& Args, UW
 {
 	if (Args.Num() < 3)
 	{
-		UE_LOG(LogBedlamCloth, Error, TEXT("Usage: BedlamCloth.CreateClothAsset <GarmentMeshPath> <BodySkeletalMeshPath> <OutputAssetPath>"));
+		UE_LOG(LogBedlamCloth, Error, TEXT("Usage: BedlamCloth.CreateClothAsset <GarmentMeshPath> <BodySkeletalMeshPath> <OutputAssetPath> [PhysicsAssetPath]"));
 		return;
 	}
 
 	const FString& GarmentPath = Args[0];
 	const FString& BodyPath    = Args[1];
 	const FString& OutputPath  = Args[2];
+	// Optional explicit physics asset. The body's collision (capsules/spheres) comes
+	// from a UPhysicsAsset; without one the cloth has NO body collision and limbs
+	// pass straight through. Normally taken from the body SKM, but if that SKM has no
+	// physics asset assigned, pass one here.
+	const FString  PhysAssetOverride = (Args.Num() >= 4) ? Args[3] : FString();
 
 	UE_LOG(LogBedlamCloth, Log, TEXT("CreateClothAsset: Garment=%s Body=%s Output=%s"),
 		*GarmentPath, *BodyPath, *OutputPath);
@@ -220,12 +368,39 @@ void FBedlamClothSetupCommands::CreateClothAsset(const TArray<FString>& Args, UW
 		return;
 	}
 
-	UPhysicsAsset* PhysAsset = BodyMesh->GetPhysicsAsset();
+	// Resolve the physics asset: explicit override first, else the body SKM's.
+	UPhysicsAsset* PhysAsset = nullptr;
+	if (!PhysAssetOverride.IsEmpty())
+	{
+		PhysAsset = LoadObject<UPhysicsAsset>(nullptr, *PhysAssetOverride);
+		if (!PhysAsset)
+		{
+			UE_LOG(LogBedlamCloth, Error, TEXT("Could not load PhysicsAsset override '%s'; falling back to the body's."),
+				*PhysAssetOverride);
+		}
+	}
+	if (!PhysAsset)
+	{
+		PhysAsset = BodyMesh->GetPhysicsAsset();
+	}
 	USkeleton* Skeleton = BodyMesh->GetSkeleton();
 
 	UE_LOG(LogBedlamCloth, Log, TEXT("Source assets loaded. PhysicsAsset=%s Skeleton=%s"),
 		PhysAsset ? *PhysAsset->GetName() : TEXT("null"),
 		Skeleton  ? *Skeleton->GetName()  : TEXT("null"));
+
+	if (!PhysAsset)
+	{
+		// This is the silent killer behind "limbs pass through the cloth": with no
+		// physics asset the SetPhysicsAsset node is empty, so the simulation has NO
+		// body colliders. Make it loud rather than producing a non-colliding asset.
+		UE_LOG(LogBedlamCloth, Error,
+			TEXT("No PhysicsAsset! The body SkeletalMesh '%s' has none assigned and no override was given. ")
+			TEXT("The cloth will have NO body collision — limbs WILL pass through it. Assign a Physics Asset to ")
+			TEXT("the body SKM, or pass one as the 4th argument: ")
+			TEXT("BedlamCloth.CreateClothAsset <garment> <body> <output> <PhysicsAssetPath>"),
+			*BodyPath);
+	}
 
 	// -----------------------------------------------------------------------
 	// 2. Create UDataflow asset (holds the graph)
@@ -346,9 +521,29 @@ void FBedlamClothSetupCommands::CreateClothAsset(const TArray<FString>& Args, UW
 		Typed->bUseCCD = BedlamClothDefaults::bUseContinuousCollision;
 	}
 
-	// Gravity, Solver — use UE defaults.
-	// Self-collision intentionally omitted: it is the dominant cost on this dense
-	// (~36k particle) sim mesh and can be re-introduced once the sim is validated.
+		// Gravity — scale world gravity down a touch so the garment drapes/sags
+		// less far downwards. Tune via BedlamClothDefaults::GravityScale.
+		{
+			auto* Typed = static_cast<FChaosClothAssetSimulationGravityConfigNode*>(GravityNode.Get());
+			Typed->GravityScaleWeighted.Low  = BedlamClothDefaults::GravityScale;
+			Typed->GravityScaleWeighted.High = BedlamClothDefaults::GravityScale;
+		}
+
+		// Solver — more substeps (+ iterations) so fast body motion is collided
+		// against within the frame; this is the main fix (with CCD) for a leg/limb
+		// tunnelling through the garment and ending up on the wrong side. Tune via
+		// BedlamClothDefaults::SolverSubsteps / SolverIterations.
+		{
+			auto* Typed = static_cast<FChaosClothAssetSimulationSolverConfigNode*>(SolverNode.Get());
+			Typed->NumSubstepsImported.ImportedValue = BedlamClothDefaults::SolverSubsteps;
+			// Set both: NumIterations is clamped to MaxNumIterations (default 6), so
+			// raise the cap too or the effective iteration count stays at 6.
+			Typed->MaxNumIterations                  = BedlamClothDefaults::SolverIterations;
+			Typed->NumIterations                     = BedlamClothDefaults::SolverIterations;
+		}
+
+		// Self-collision intentionally omitted: it is the dominant cost on this dense
+		// (~36k particle) sim mesh and can be re-introduced once the sim is validated.
 
 	// -----------------------------------------------------------------------
 	// 5. Connect the node chain via Collection passthrough
@@ -424,6 +619,10 @@ void FBedlamClothSetupCommands::CreateClothAsset(const TArray<FString>& Args, UW
 	UE_LOG(LogBedlamCloth, Log, TEXT("Evaluating Dataflow to build cloth asset..."));
 	UDataflowBlueprintLibrary::EvaluateTerminalNodeByName(
 		DataflowAsset, FName("Terminal"), ClothAsset);
+
+	// Create the visual (UEdGraphNode) counterparts so the graph is inspectable in
+	// the Dataflow editor instead of opening empty.
+	SyncEdGraphNodes(DataflowAsset);
 
 	// -----------------------------------------------------------------------
 	// 8. Save both assets
@@ -525,6 +724,9 @@ static void ReevaluateAndSave(
 	UE_LOG(LogBedlamCloth, Log, TEXT("Re-evaluating Dataflow..."));
 	UDataflowBlueprintLibrary::EvaluateTerminalNodeByName(
 		DataflowAsset, FName("Terminal"), ClothAsset);
+
+	// Keep the visual graph in sync (e.g. SetWeightMap adds a PaintWeightMap node).
+	SyncEdGraphNodes(DataflowAsset);
 
 	DataflowAsset->MarkPackageDirty();
 	ClothAsset->MarkPackageDirty();
@@ -944,7 +1146,8 @@ void FBedlamClothSetupCommands::ConfigureSimulation(const TArray<FString>& Args,
 	{
 		UE_LOG(LogBedlamCloth, Error,
 			TEXT("Usage: BedlamCloth.ConfigureSimulation <ClothAssetPath> [Key=Value ...]\n")
-			TEXT("  Keys: Gravity (scale), Damping (0-1), SelfCollision (true only),\n")
+			TEXT("  Keys: Gravity (scale), Damping (0-1), Bending (0-1), Stretch (0-1),\n")
+			TEXT("        SelfCollision (true only),\n")
 			TEXT("        Substeps (int), Iterations (int), CollisionThickness (cm),\n")
 			TEXT("        Friction (cloth<->body grip), CCD (true/false; anti-tunnelling),\n")
 			TEXT("        MaxDistance (cm; if a weight map from SetWeightMap auto/file is\n")
@@ -1021,6 +1224,44 @@ void FBedlamClothSetupCommands::ConfigureSimulation(const TArray<FString>& Args,
 		}
 	}
 
+	// --- Bending (PBD bending stiffness 0-1; higher = stiffer, less waving) ---
+	if (const FString* Val = Params.Find(TEXT("Bending")))
+	{
+		auto* Node = static_cast<FChaosClothAssetSimulationBendingConfigNode*>(
+			FindNodeByType(*Graph, FName("FChaosClothAssetSimulationBendingConfigNode")));
+		if (Node)
+		{
+			float Bending = FCString::Atof(**Val);
+			Node->BendingStiffness.Low  = Bending;
+			Node->BendingStiffness.High = Bending;
+			UE_LOG(LogBedlamCloth, Log, TEXT("  Bending = %f"), Bending);
+			++AppliedCount;
+		}
+		else
+		{
+			UE_LOG(LogBedlamCloth, Warning, TEXT("  BendingConfigNode not found in graph"));
+		}
+	}
+
+	// --- Stretch (PBD stretch stiffness 0-1; higher = less stretchy/rubbery) ---
+	if (const FString* Val = Params.Find(TEXT("Stretch")))
+	{
+		auto* Node = static_cast<FChaosClothAssetSimulationStretchConfigNode*>(
+			FindNodeByType(*Graph, FName("FChaosClothAssetSimulationStretchConfigNode")));
+		if (Node)
+		{
+			float Stretch = FCString::Atof(**Val);
+			Node->StretchStiffness.Low  = Stretch;
+			Node->StretchStiffness.High = Stretch;
+			UE_LOG(LogBedlamCloth, Log, TEXT("  Stretch = %f"), Stretch);
+			++AppliedCount;
+		}
+		else
+		{
+			UE_LOG(LogBedlamCloth, Warning, TEXT("  StretchConfigNode not found in graph"));
+		}
+	}
+
 	// --- SelfCollision ---
 	if (const FString* Val = Params.Find(TEXT("SelfCollision")))
 	{
@@ -1066,8 +1307,12 @@ void FBedlamClothSetupCommands::ConfigureSimulation(const TArray<FString>& Args,
 		if (Node)
 		{
 			int32 Iterations = FCString::Atoi(**Val);
-			Node->NumIterations = Iterations;
-			UE_LOG(LogBedlamCloth, Log, TEXT("  Iterations = %d"), Iterations);
+			// NumIterations is clamped to MaxNumIterations (node default only 6) — set
+			// both, otherwise the effective count silently stays at 6 ("Iterations
+			// won't change" bug).
+			Node->MaxNumIterations = Iterations;
+			Node->NumIterations    = Iterations;
+			UE_LOG(LogBedlamCloth, Log, TEXT("  Iterations (Num+Max) = %d"), Iterations);
 			++AppliedCount;
 		}
 		else
@@ -1179,6 +1424,45 @@ void FBedlamClothSetupCommands::ConfigureSimulation(const TArray<FString>& Args,
 
 	UE_LOG(LogBedlamCloth, Log, TEXT("SUCCESS: ConfigureSimulation applied %d parameter(s) to %s"),
 		AppliedCount, *ClothAssetPath);
+}
+
+// ===========================================================================
+// BedlamCloth.ShowGraph
+// Rebuilds the visual Dataflow graph (UEdGraphNodes) for an EXISTING script-built
+// cloth asset so its nodes become visible/inspectable in the Dataflow editor.
+// Does NOT change any simulation data — it only adds the missing visual nodes and
+// wiring, then saves. Use it on assets created before this was automatic, or any
+// time the graph opens empty. (New assets get this for free via CreateClothAsset.)
+// ===========================================================================
+void FBedlamClothSetupCommands::ShowGraph(const TArray<FString>& Args, UWorld* World)
+{
+	if (Args.Num() < 1)
+	{
+		UE_LOG(LogBedlamCloth, Error, TEXT("Usage: BedlamCloth.ShowGraph <ClothAssetPath>"));
+		return;
+	}
+
+	const FString& ClothAssetPath = Args[0];
+	UE_LOG(LogBedlamCloth, Log, TEXT("ShowGraph: Asset=%s"), *ClothAssetPath);
+
+	UChaosClothAsset* ClothAsset = nullptr;
+	UDataflow* DataflowAsset = nullptr;
+	TSharedPtr<UE::Dataflow::FGraph> Graph;
+	if (!LoadClothAndGraph(ClothAssetPath, ClothAsset, DataflowAsset, Graph))
+	{
+		return;
+	}
+
+	SyncEdGraphNodes(DataflowAsset);
+
+	DataflowAsset->MarkPackageDirty();
+	const FString DFAssetPath = DataflowAsset->GetOutermost()->GetName();
+	UEditorAssetLibrary::SaveAsset(DFAssetPath, false);
+
+	UE_LOG(LogBedlamCloth, Log,
+		TEXT("SUCCESS: ShowGraph rebuilt the visual graph for %s. Open the cloth asset's "
+		     "Dataflow (%s) to inspect/edit the nodes."),
+		*ClothAssetPath, *DFAssetPath);
 }
 
 // ---------------------------------------------------------------------------
@@ -1608,9 +1892,22 @@ void FBedlamClothSetupCommands::RecordChaosCache(const TArray<FString>& Args, UW
 		return;
 	}
 
-	UPhysicsAsset* PhysAsset = BodyMesh->GetPhysicsAsset();
+	// Prefer the physics asset the cloth was authored with (SetPhysicsAsset node);
+	// fall back to the body SKM's. This is the body's collision source during the
+	// recorded simulation — without it, limbs pass through the cloth.
+	UPhysicsAsset* PhysAsset = ClothAsset->GetPhysicsAsset();
+	if (!PhysAsset)
+	{
+		PhysAsset = BodyMesh->GetPhysicsAsset();
+	}
 	UE_LOG(LogBedlamCloth, Log, TEXT("Assets loaded. PhysicsAsset=%s AnimLength=%.3fs"),
 		PhysAsset ? *PhysAsset->GetName() : TEXT("null"), AnimSeq->GetPlayLength());
+	if (!PhysAsset)
+	{
+		UE_LOG(LogBedlamCloth, Warning,
+			TEXT("No PhysicsAsset on the cloth asset or body — recording will have NO body collision; ")
+			TEXT("limbs will pass through the cloth. Set one in CreateClothAsset (4th arg) or on the body SKM."));
+	}
 
 	// -----------------------------------------------------------------------
 	// 2. Create the output cache collection asset
