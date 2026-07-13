@@ -32,6 +32,7 @@
 #include "Components/SkeletalMeshComponent.h"
 #include "Animation/AnimSequence.h"
 #include "AssetRegistry/AssetRegistryModule.h"
+#include "AssetRegistry/IAssetRegistry.h"   // auto-discover the body's physics asset
 #include "Containers/Ticker.h"
 #include "Misc/App.h"
 
@@ -124,21 +125,25 @@ namespace BedlamClothDefaults
 	// Solver substeps per frame. Each substep re-evaluates body collision with the
 	// collider position interpolated within the frame, so MORE substeps is the main
 	// fix for a fast-moving limb (e.g. a leg stepping forward) punching through the
-	// garment and ending up on the wrong side between frames. Combined with CCD this
-	// is the lever against "the leg passes through the dress". Recording is offline,
-	// so the extra cost per substep is acceptable. Raised to 5 because body
-	// penetration persisted at 3; go higher (8+) if it still tunnels on fast motion.
-	static constexpr int32 SolverSubsteps = 5;
+	// garment between frames. Combined with CCD this is the lever against fast-limb
+	// tunnelling. Solver cost scales ~ SolverSubsteps * SolverIterations, so this is
+	// the other main performance dial. Back to 3: the earlier bump to 5 was chasing
+	// penetration that was actually a MISSING PHYSICS ASSET (no colliders), not too
+	// few substeps. 3 is performant and enough once real collision exists; raise to
+	// 5-8 only if a genuinely fast limb still tunnels.
+	static constexpr int32 SolverSubsteps = 3;
 
-	// Solver (constraint) iterations. Higher = stiffer, more stable constraint +
-	// collision resolution, so the cloth holds its shape and resists being pushed
-	// through the body. NOTE: the solver node has TWO fields — NumIterations (the
-	// count at 60fps) AND MaxNumIterations (a hard cap, node default only 6).
-	// NumIterations is clamped to MaxNumIterations, so we MUST set both or the
-	// effective count silently stays at 6 (this was a real bug — the sim ran at 6
-	// iterations and limbs punched through). CreateClothAsset/ConfigureSimulation set
-	// both to this value.
-	static constexpr int32 SolverIterations = 40;
+	// Solver (constraint) iterations. Higher = stiffer/more stable, but solver cost
+	// scales ~ SolverSubsteps * SolverIterations, so this is a primary performance
+	// dial. 10 is the top of the node's normal range (UIMax=10) and is plenty for a
+	// non-stretchy look — the leg-through fix was the PHYSICS ASSET (real colliders),
+	// NOT brute-force iterations, so 40 just cost time without helping. Raise only if
+	// the cloth visibly stretches.
+	// NOTE: the solver node has TWO fields — NumIterations (count at 60fps) AND
+	// MaxNumIterations (a hard cap, node default only 6). NumIterations is clamped to
+	// MaxNumIterations, so we MUST set both or the effective count silently stays at 6.
+	// CreateClothAsset/ConfigureSimulation set both to this value.
+	static constexpr int32 SolverIterations = 10;
 
 	// --- Collision (applies to every mode) ------------------------------------
 	// Collision against the body's physics asset is always on (the cloth solver's
@@ -328,6 +333,77 @@ static void SyncEdGraphNodes(UDataflow* DataflowAsset)
 #endif // WITH_EDITOR
 }
 
+// ---------------------------------------------------------------------------
+// Helper: resolve the physics asset that gives the body its collision shapes.
+// Order: (1) the body SKM's own assigned physics asset; (2) auto-discover a
+// UPhysicsAsset sitting in the SAME content folder as the body (the usual FBX
+// import layout, e.g. "body_PhysicsAsset" next to "body") — preferring one whose
+// name contains the body's name. Returns null if none found.
+//
+// This exists because a body imported WITHOUT create_physics_asset has no physics
+// asset *assigned*, even though one may exist on disk — and a cloth built with no
+// physics asset has zero body colliders, so limbs pass straight through. Callers
+// still accept an explicit override (CreateClothAsset's 4th arg) which wins over
+// this.
+// ---------------------------------------------------------------------------
+static UPhysicsAsset* ResolveBodyPhysicsAsset(USkeletalMesh* BodyMesh)
+{
+	if (!BodyMesh)
+	{
+		return nullptr;
+	}
+	if (UPhysicsAsset* Assigned = BodyMesh->GetPhysicsAsset())
+	{
+		return Assigned;
+	}
+
+	// Auto-discover in the body's package folder via the asset registry.
+	FAssetRegistryModule& ARM = FModuleManager::LoadModuleChecked<FAssetRegistryModule>("AssetRegistry");
+	IAssetRegistry& AR = ARM.Get();
+
+	const FString BodyPackage = BodyMesh->GetOutermost()->GetName();   // /Game/.../body
+	const FString Dir         = FPackageName::GetLongPackagePath(BodyPackage);
+	const FString BodyShort   = FPackageName::GetShortName(BodyPackage);
+
+	TArray<FAssetData> InDir;
+	AR.GetAssetsByPath(FName(*Dir), InDir, /*bRecursive*/ false);
+
+	const FTopLevelAssetPath PhysClass = UPhysicsAsset::StaticClass()->GetClassPathName();
+	UPhysicsAsset* First = nullptr;
+	for (const FAssetData& A : InDir)
+	{
+		if (A.AssetClassPath != PhysClass)
+		{
+			continue;
+		}
+		UPhysicsAsset* P = Cast<UPhysicsAsset>(A.GetAsset());
+		if (!P)
+		{
+			continue;
+		}
+		if (!First)
+		{
+			First = P;
+		}
+		if (A.AssetName.ToString().Contains(BodyShort))
+		{
+			UE_LOG(LogBedlamCloth, Warning,
+				TEXT("Body SKM had no physics asset assigned; auto-discovered '%s' (matches body name) in %s. "
+				     "Pass an explicit one as CreateClothAsset's 4th arg to override."),
+				*P->GetName(), *Dir);
+			return P;
+		}
+	}
+	if (First)
+	{
+		UE_LOG(LogBedlamCloth, Warning,
+			TEXT("Body SKM had no physics asset assigned; auto-discovered '%s' in %s (first physics asset in the folder). "
+			     "Pass an explicit one as CreateClothAsset's 4th arg if that is wrong."),
+			*First->GetName(), *Dir);
+	}
+	return First;
+}
+
 // ===========================================================================
 // BedlamCloth.CreateClothAsset
 // ===========================================================================
@@ -381,7 +457,7 @@ void FBedlamClothSetupCommands::CreateClothAsset(const TArray<FString>& Args, UW
 	}
 	if (!PhysAsset)
 	{
-		PhysAsset = BodyMesh->GetPhysicsAsset();
+		PhysAsset = ResolveBodyPhysicsAsset(BodyMesh);  // body's own, else auto-discover in its folder
 	}
 	USkeleton* Skeleton = BodyMesh->GetSkeleton();
 
@@ -1898,7 +1974,7 @@ void FBedlamClothSetupCommands::RecordChaosCache(const TArray<FString>& Args, UW
 	UPhysicsAsset* PhysAsset = ClothAsset->GetPhysicsAsset();
 	if (!PhysAsset)
 	{
-		PhysAsset = BodyMesh->GetPhysicsAsset();
+		PhysAsset = ResolveBodyPhysicsAsset(BodyMesh);  // body's own, else auto-discover in its folder
 	}
 	UE_LOG(LogBedlamCloth, Log, TEXT("Assets loaded. PhysicsAsset=%s AnimLength=%.3fs"),
 		PhysAsset ? *PhysAsset->GetName() : TEXT("null"), AnimSeq->GetPlayLength());

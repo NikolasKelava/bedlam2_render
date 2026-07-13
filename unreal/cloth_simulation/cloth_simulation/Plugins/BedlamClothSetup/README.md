@@ -20,7 +20,7 @@ pipeline can stay Python-driven (call them with
 
 | Command | Status |
 |---|---|
-| `BedlamCloth.CreateClothAsset` | ✅ Working — optional 4th arg `[PhysicsAssetPath]`; loud error if the body has no physics asset (= no collision). Natural-fabric defaults: `MaxDistance` 5, weight-map skirt `High` 20, `Bending` 0.8, `Damping` 0.1, `Gravity` 0.5 (decouples drape from leg-collision), `Solver` 5 substeps / 40 iterations (sets NumIterations **and** MaxNumIterations — the latter caps at 6 by default), `CollisionThickness` 1.0. All tunable in `BedlamClothDefaults`. |
+| `BedlamCloth.CreateClothAsset` | ✅ Working — optional 4th arg `[PhysicsAssetPath]`; if omitted, uses the body SKM's physics asset, else **auto-discovers** one in the body's folder; loud error only if none found anywhere. Natural-fabric defaults: `MaxDistance` 5, weight-map skirt `High` 20, `Bending` 0.8, `Damping` 0.1, `Gravity` 0.5 (decouples drape from leg-collision), `Solver` 3 substeps / 10 iterations (performant; sets NumIterations **and** MaxNumIterations — the latter caps at 6 by default), `CollisionThickness` 1.0. All tunable in `BedlamClothDefaults`. |
 | `BedlamCloth.SetWeightMap` | ✅ Working — `all_dynamic` (fixed), `auto` (per-vertex proximity), `file`. Dynamic `High` 20 cm (a modest, fabric-like skirt freedom; collision keeps it off the legs). |
 | `BedlamCloth.ConfigureSimulation` | ✅ Working — MaxDistance weight-map-aware; `Bending`/`Stretch`/`Friction`/`CCD` keys added |
 | `BedlamCloth.RecordChaosCache` | ✅ Complete — PIE-based, warmup/settle frames, auto-save, auto-cleanup |
@@ -63,13 +63,15 @@ Builds a `UChaosClothAsset` (+ a sibling `UDataflow` asset at `<OutputAssetPath>
 from a garment **StaticMesh** and a body **SkeletalMesh**, evaluates the Dataflow
 graph, and saves both. Sets the cloth asset's skeleton and physics asset from the body.
 
-> ⚠️ **The body MUST have a Physics Asset — it is the body's collision.** The
-> optional 4th arg lets you point at one explicitly; otherwise the body SKM's own
-> Physics Asset is used. **If neither exists the cloth has NO body collision and
-> limbs pass straight through it** (the command now logs a loud error in that case).
-> This was a real footgun: a body imported without `create_physics_asset` produces a
-> cloth whose `SetPhysAsset` node is empty — open the Dataflow and confirm that node
-> has a Physics Asset assigned. See [§ footguns](#known-limitations--footguns).
+> ⚠️ **The body MUST have a Physics Asset — it is the body's collision.** Resolution
+> order: (1) the 4th arg if given; (2) the body SKM's own Physics Asset; (3)
+> **auto-discovery** of a `UPhysicsAsset` in the body's content folder (preferring a
+> name-match). **Only if none exists anywhere** does the cloth get NO body collision
+> (limbs pass straight through) — the command logs a loud error then. This was the #1
+> real footgun: a body imported without `create_physics_asset` had no asset
+> *assigned*, leaving the `SetPhysAsset` node empty. After creating, you can still
+> open the Dataflow and confirm that node has a Physics Asset. See
+> [§ footguns](#known-limitations--footguns).
 
 The Dataflow graph it builds (Collection passthrough chain):
 ```
@@ -89,8 +91,8 @@ with `ConfigureSimulation` / `SetWeightMap`. Current defaults:
 | `BendingStiffness` | 0.8 | PBD bending [0,1]; higher = firmer folds, less floppy waving; lower = floppier. |
 | `DampingCoefficient` | 0.1 | Global point damping [0,1]. **Knob for "behaves like rubber / waves too much":** higher bleeds off oscillation so it settles. |
 | `GravityScale` | 0.5 | World-gravity multiplier. **The knob that decouples drape from leg-collision:** keep `MaxDistance` big enough for the leg, then lower gravity so the skirt only spends a fraction of that headroom sagging. Lower = less drape (collision headroom unchanged). ~0.4–0.7. |
-| `SolverSubsteps` | 5 | Solver substeps/frame. **Main knob (with CCD) for "a leg passes through the body/dress":** more substeps re-collide against the limb's interpolated position within the frame, stopping fast-limb tunnelling. Raise to 8+ if it persists. |
-| `SolverIterations` | 40 | Constraint iterations; higher = stiffer, more stable collision resolution (helps stop limbs pushing through). **Sets BOTH `NumIterations` and `MaxNumIterations`** — the latter is a hard cap that defaults to **6**, so setting `NumIterations` alone silently leaves the sim at 6 iterations. |
+| `SolverSubsteps` | 3 | Solver substeps/frame; re-collides against the limb's interpolated position within the frame (anti-tunnelling). **Performance dial** — cost ≈ `Substeps × Iterations`. 3 is enough once a real physics asset exists; raise to 5–8 only if a fast limb still tunnels. |
+| `SolverIterations` | 10 | Constraint iterations; higher = stiffer. **Performance dial** (cost ≈ `Substeps × Iterations`). 10 is the top of the node's normal range and plenty for a non-stretchy look. **Sets BOTH `NumIterations` and `MaxNumIterations`** — the latter is a hard cap defaulting to **6**, so setting `NumIterations` alone silently leaves the sim at 6. |
 | `CollisionThicknessCm` | 1.0 | Added thickness of body collision shapes; larger = caught further out but a puffier/offset drape. 1.0 reads most natural (the earlier 2.0 was chasing poke-through that was really a missing physics asset). |
 | `FrictionCoefficient` | 0.8 | Cloth↔body grip (slides off less when higher). |
 | `bUseContinuousCollision` | true | CCD — stops fast cloth tunnelling through the thin capsule collision. |
@@ -107,9 +109,10 @@ Key points:
   does **not** hold an un-anchored garment up (see `all_dynamic` note).
 - **Gravity + Solver** are now set explicitly (previously rode on node defaults).
   `GravityScale=0.5` controls downward drape (and decouples it from the leg-collision
-  headroom that `MaxDistance` must keep large — see footguns); `SolverSubsteps=5` +
-  `SolverIterations=30` give stable collision/constraint resolution. Tune in
-  `BedlamClothDefaults`.
+  headroom that `MaxDistance` must keep large — see footguns); `SolverSubsteps=3` +
+  `SolverIterations=10` give stable resolution at a performant cost (cost ≈
+  substeps × iterations; the real anti-penetration fix is the physics asset, not
+  brute force here). Tune in `BedlamClothDefaults`.
 - **Self-Collision is intentionally NOT added** (it was the dominant cost on the
   dense ~36k-particle sim mesh, >1 min/frame). Re-add later once validated if
   self-intersection matters.
@@ -213,7 +216,7 @@ keeps the kinematic `Low=0`. With **no** weight map, `MaxDistance` instead sets 
 uniform `Low=High`, so use `MaxDistance=5` (the uniform default) for a plain,
 weight-map-less asset:
 ```
-BedlamCloth.ConfigureSimulation /Game/ClothSimulation/ClothAssets/CA_garment MaxDistance=20 Bending=0.8 Stretch=1.0 Damping=0.1 Gravity=0.5 Substeps=5 Iterations=40 CollisionThickness=1.0 Friction=0.8 CCD=true
+BedlamCloth.ConfigureSimulation /Game/ClothSimulation/ClothAssets/CA_garment MaxDistance=20 Bending=0.8 Stretch=1.0 Damping=0.1 Gravity=0.5 Substeps=3 Iterations=10 CollisionThickness=1.0 Friction=0.8 CCD=true
 ```
 
 ### 4. `BedlamCloth.RecordChaosCache <ClothAssetPath> <BodySKMPath> <AnimPath> <OutputCachePath> [NumFrames]`
@@ -401,9 +404,10 @@ the final lines are `Record: cache '<name>' recorded <N> frames ... Saved=OK` an
   `create_physics_asset` has none, so the node is empty and the simulation has
   nothing to collide against — no amount of substeps/CCD/thickness helps because
   there are no colliders. **Check:** open the cloth asset's `*_DF` Dataflow and
-  confirm the `SetPhysAsset` node has a Physics Asset. **Fix:** assign one to the
-  body SKM, or pass it as the 4th arg to `CreateClothAsset`. `CreateClothAsset` /
-  `RecordChaosCache` now log a loud error/warning when it is missing.
+  confirm the `SetPhysAsset` node has a Physics Asset. **Fix:** `CreateClothAsset` /
+  `RecordChaosCache` now resolve it as 4th-arg → body SKM → **auto-discovery in the
+  body's folder**, and log a loud error only if none is found anywhere. So normally
+  it "just works"; if auto-discovery picks the wrong one, pass the 4th arg.
 - **Solver `NumIterations` is capped by `MaxNumIterations` (default 6).** Setting
   `NumIterations` (via `ConfigureSimulation Iterations=` or in the node) appears to do
   nothing — the count stays at 6 — because the node clamps it to `MaxNumIterations`,
@@ -447,7 +451,22 @@ the final lines are `Record: cache '<name>' recorded <N> frames ... Saved=OK` an
 - One recording at a time (guarded). A stale session (PIE that failed to start) is
   auto-cleared on the next `RecordChaosCache` call.
 
-## Future work
-- Optional self-collision re-enable (arg or config key) + sim-mesh decimation.
-- Expose record FPS as an argument.
-- Integrate into the main BEDLAM2 pipeline (replace CLO3D GeometryCache clothing).
+## Future work (ranked backlog)
+Several items target the *silent-footgun* pattern that dominated tuning (empty physics
+asset, iteration cap, kinematic skirt, invisible nodes).
+1. **`BedlamCloth.Validate <cloth>`** — one command that checks + reports the common
+   silent problems: `SetPhysAsset` populated, `MaxNumIterations ≥ NumIterations`, a
+   MaxDistance weight map present, sim-mesh particle count (perf), skeleton match.
+2. **Sim-mesh decimation** (biggest perf lever) — the garment is the full render mesh
+   (~36k particles) as the *sim* mesh. Insert a `FChaosClothAssetRemeshNode_v2`
+   (sim-only, `DensityMapSim.Low` < 100) after `TransferSkinWeights`. Note: its
+   UPROPERTYs are `private` → set via FProperty reflection.
+3. **Backstop weight map** — robust "keep cloth outside the body" constraint; lets
+   `MaxDistance` stay small (less drape) without legs clipping.
+4. **Per-garment-type presets** (dress/shirt/pants) from JSON instead of one hardcoded
+   `BedlamClothDefaults`.
+5. **Skin-weight transfer controls** — expose `InpaintWeights`
+   `RadiusPercentage`/`NormalThreshold` to fix the hand artifact & torso-bound skirt
+   at the source.
+- Also: optional self-collision re-enable, expose record FPS, and integrate into the
+  main BEDLAM2 pipeline (replace CLO3D GeometryCache clothing).
